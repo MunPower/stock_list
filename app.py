@@ -285,7 +285,8 @@ LIST_CSS = """<style>
 .sl-top a.tab.rf{min-width:0;font-size:14px;font-weight:600;color:#1f4fa8 !important;background:#fff;border-color:#9db4e0}
 .sl-top .asof{margin-left:auto;font-size:12px;color:#888;white-space:nowrap}
 .tm{font-size:12px;color:#888;white-space:nowrap}.tm b{font-weight:600}
-@media (max-width:600px){.sl-top{flex-wrap:wrap}.sl-top .tm{order:3;width:100%}}
+.sl-top .brk{display:none}
+@media (max-width:600px){.sl-top{flex-wrap:wrap;row-gap:6px}.sl-top .brk{display:block;flex-basis:100%;height:0}.sl-top .tm{flex:1 1 auto;font-size:12px}.sl-top .asof{font-size:12px}}
 .sl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid #c9ced6}
 .sl-wrap table{border-collapse:collapse;width:100%;min-width:760px;font-size:13px;margin:0}
 .sl-wrap th{background:#e9edf3;color:#333;font-weight:600;padding:6px;border:1px solid #d3d8df;white-space:nowrap;text-align:center}
@@ -334,7 +335,7 @@ if not qp.get("code"):
         h = [LIST_CSS, '<div class="sl-top">']
         for m, label in (("KOSPI", "코스피"), ("KOSDAQ", "코스닥")):
             h.append(f'<a class="tab{" on" if m == market else ""}" href="{link(m=m)}" target="_self">{label}</a>')
-        h.append(f'<a class="tab rf" href="{link(m=market, refresh=1)}" target="_self" title="시세 다시 받기">↻ 새로고침</a>')
+        h.append(f'<a class="tab rf" href="{link(m=market, refresh=1)}" target="_self" title="시세 다시 받기">↻ 새로고침</a><span class="brk"></span>')
         h.append(tm or '<span class="tm">⏱ 측정 중…</span>')
         h.append(f'<span class="asof">기준 {asof}</span></div>')
         h.append('<div class="sl-wrap"><table><thead><tr><th class="rk">순위</th><th class="cd">종목코드</th>'
