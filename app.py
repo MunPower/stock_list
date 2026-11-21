@@ -98,7 +98,6 @@ def top_lists(n: int = TOP_N):
 
 
 # ───────────── 공통: 시세 받기 + 매도선·매수선 계산 (리스트 신호와 차트가 똑같이 사용) ─────────────
-from functools import lru_cache
 
 
 def _start(days: int) -> str:
@@ -112,6 +111,28 @@ STORE_TTL = 600     # 받은 시세를 10분 동안 재사용
 def _store():
     """리스트에서 받은 종목 시세를 차트도 그대로 쓰도록 서버에 보관하는 저장소"""
     return {"lock": threading.Lock(), "data": {}}
+
+
+@st.cache_resource(show_spinner=False)
+def _sig_store():
+    """종목별 신호 보관함 {(코드, 기간): (그 시세를 받은 시각, 신호)}"""
+    return {}
+
+
+def _hist_time(code: str, days: int):
+    ent = _store()["data"].get((code, int(days)))
+    return ent[0] if ent and time.time() - ent[0] < STORE_TTL else None
+
+
+def known_signals(codes: tuple, days: int) -> dict:
+    """시세도 신호도 이미 보관돼 있는 종목만 {코드: 신호} (받기·계산 없이 바로)"""
+    out, ss_ = {}, _sig_store()
+    for c in codes:
+        t = _hist_time(c, days)
+        ent = ss_.get((c, int(days)))
+        if t is not None and ent and ent[0] == t:
+            out[c] = ent[1]
+    return out
 
 
 def cached_hist(code: str, days: int):
@@ -141,9 +162,10 @@ def idx_hist(sym: str, days: int):
     return fdr.DataReader(sym, _start(days)).tail(int(days))
 
 
-@lru_cache(maxsize=8)
+@st.cache_resource(show_spinner=False, max_entries=32)
 def _hp_inv(n: int, lam: float) -> np.ndarray:
-    """HP필터 계산용 행렬의 역행렬. 기간(n)이 같으면 모든 종목이 같은 행렬이라 한 번만 만들어 재사용"""
+    """HP필터 계산용 행렬의 역행렬. 기간(n)이 같으면 모든 종목이 같은 행렬이라 한 번만 만들어
+    서버에 계속 보관 (화면을 새로 열어도 다시 만들지 않음)"""
     D = np.zeros((n - 2, n))
     for i in range(n - 2):
         D[i, i:i + 3] = [1, -2, 1]
@@ -212,18 +234,26 @@ def list_signals(codes: tuple):
     t_fetch = time.time() - _t
     _t = time.time()
     sig, got = {}, 0
+    known = known_signals(codes, days)
+    ss_ = _sig_store()
     for c in codes:
         d = data.get(c)
         sig[c] = None
         if d is None:
             continue
         got += 1
+        if c in known:                    # 같은 시세로 이미 계산해 둔 신호
+            sig[c] = known[c]
+            continue
         try:
             y = d["Close"].to_numpy(dtype=float)
             if len(y) >= 60 and np.isfinite(y).all():
                 sig[c] = signal_of(y)
         except Exception:
             pass
+        t = _hist_time(c, days)
+        if t is not None:
+            ss_[(c, int(days))] = (t, sig[c])
     return sig, got, t_fetch, time.time() - _t
 
 
@@ -309,7 +339,7 @@ if not qp.get("code"):
             arrow = "" if not pct else ("▲ " if pct > 0 else "▼ ")
             pct_t = "-" if pct is None else f"{pct:+.2f}%" if pct else "0.00%"
             nm_e, c_e = html.escape(nm), html.escape(c)
-            if sig is None:                                   # 아직 계산 중
+            if sig is None or c not in sig:                   # 아직 계산 중
                 sg = '<td class="sg wait">' + a + '…</a></td>'
             else:
                 v = sig.get(c)
@@ -333,9 +363,9 @@ if not qp.get("code"):
     days = max(int(calc), 180)
     note = st.empty()
     ph = st.empty()
-    ready = all(cached_hist(c, days) is not None for c in codes)    # 10분 안에 받은 시세가 다 있음
-    if not ready:
-        ph.markdown(build(None), unsafe_allow_html=True)      # ① 리스트 먼저 표시
+    known = known_signals(codes, days)                        # 보관된 신호(받기·계산 없이 바로)
+    ph.markdown(build(known), unsafe_allow_html=True)         # ① 리스트를 항상 먼저 표시
+    if len(known) < len(codes):
         note.caption("⏳ 매수·매도 신호를 계산하는 중입니다… (처음 한 번은 조금 걸려요)")
     _t0 = time.time()
     try:
