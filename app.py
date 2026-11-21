@@ -282,6 +282,7 @@ LIST_CSS = """<style>
 .sl-top a.tab{display:inline-block;min-width:92px;text-align:center;padding:8px 14px;font-size:16px;font-weight:700;
  border:1px solid #c9ced6;background:#f4f5f7;color:#555 !important;border-radius:8px;text-decoration:none !important}
 .sl-top a.tab.on{background:#1f4fa8;border-color:#1f4fa8;color:#fff !important}
+.sl-top a.tab.rf{min-width:0;font-size:14px;font-weight:600;color:#1f4fa8 !important;background:#fff;border-color:#9db4e0}
 .sl-top .asof{margin-left:auto;font-size:12px;color:#888;white-space:nowrap}
 .tm{font-size:12px;color:#888;white-space:nowrap}.tm b{font-weight:600}
 @media (max-width:600px){.sl-top{flex-wrap:wrap}.sl-top .tm{order:3;width:100%}}
@@ -300,6 +301,7 @@ LIST_CSS = """<style>
 .sl-wrap .up{color:#e5484d}.sl-wrap .dn{color:#1a56db}.sl-wrap .eq{color:#333}
 @media (max-width:600px){
  .sl-top a.tab{min-width:80px;padding:7px 10px;font-size:15px}
+ .sl-top a.tab.rf{min-width:0;padding:7px 8px;font-size:13px}
  .sl-wrap table{min-width:620px}
  .sl-wrap th.cd,.sl-wrap td.cd{display:none}
  .sl-wrap td.nm .sub{display:block}
@@ -314,6 +316,12 @@ LIST_CSS = """<style>
 
 if not qp.get("code"):
     market = "KOSDAQ" if qp.get("m") == "KOSDAQ" else "KOSPI"     # 기본값은 코스피
+    if qp.get("refresh"):                                         # ↻ 새로고침을 눌렀음 → 시세 다시 받기
+        top_lists.clear()
+        idx_hist.clear()
+        with _store()["lock"]:
+            _store()["data"].clear()
+        del st.query_params["refresh"]
     with st.spinner("코스피·코스닥 시가총액 순위를 불러오는 중입니다…"):
         _tl = time.time()
         lists, asof = top_lists()
@@ -326,6 +334,7 @@ if not qp.get("code"):
         h = [LIST_CSS, '<div class="sl-top">']
         for m, label in (("KOSPI", "코스피"), ("KOSDAQ", "코스닥")):
             h.append(f'<a class="tab{" on" if m == market else ""}" href="{link(m=m)}" target="_self">{label}</a>')
+        h.append(f'<a class="tab rf" href="{link(m=market, refresh=1)}" target="_self" title="시세 다시 받기">↻ 새로고침</a>')
         h.append(tm or '<span class="tm">⏱ 측정 중…</span>')
         h.append(f'<span class="asof">기준 {asof}</span></div>')
         h.append('<div class="sl-wrap"><table><thead><tr><th class="rk">순위</th><th class="cd">종목코드</th>'
@@ -378,14 +387,6 @@ if not qp.get("code"):
         st.caption(f"※ {len(rows)}종목 중 {_got}종목만 시세를 받아 신호를 계산했습니다 ({time.time() - _t0:.0f}초).")
     _tm = timing_html([("리스트", t_list), ("시세", t_fetch), ("계산", t_calc)])
     ph.markdown(build(sig, _tm), unsafe_allow_html=True)      # ② 신호 칸 + 걸린 시간 채워서 표시
-    st.markdown("<style>div.stButton > button{padding:2px 12px;min-height:0;font-size:13px;}</style>",
-                unsafe_allow_html=True)
-    if st.button("↻ 새로고침 (시세 다시 받기)", key="refresh_btn"):
-        top_lists.clear()
-        idx_hist.clear()
-        with _store()["lock"]:
-            _store()["data"].clear()
-        st.rerun()
     st.stop()
 
 
