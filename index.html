@@ -2,148 +2,49 @@
 <html lang="ko">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>코스피·코스닥 TOP80 차트</title>
+<!-- 앱 서버와 차트 라이브러리 서버에 미리 연결해 두어 첫 로딩을 조금 줄임 -->
+<link rel="preconnect" href="https://여기에-앱주소.streamlit.app" crossorigin>
+<link rel="dns-prefetch" href="https://여기에-앱주소.streamlit.app">
+<link rel="preconnect" href="https://cdn.plot.ly" crossorigin>
+<link rel="dns-prefetch" href="https://cdn.plot.ly">
 <style>
-  * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; background: #fff; font-family: -apple-system, "Malgun Gothic", "Apple SD Gothic Neo", sans-serif; }
+  /* 아래쪽에서 잘라낼 높이(px). Streamlit 문구/Fullscreen/Manage app이 남아 있으면 값을 키우세요. */
+  :root { --crop: 72px; }
 
-  /* ── 위쪽: 코스피 / 코스닥 버튼 ── */
-  .top { display: flex; align-items: center; gap: 8px; padding: 4px 2px 8px 2px; }
-  .tab { flex: 0 0 auto; min-width: 92px; padding: 8px 14px; font-size: 16px; font-weight: 700;
-         border: 1px solid #c9ced6; background: #f4f5f7; color: #555; border-radius: 8px; cursor: pointer; }
-  .tab.on { background: #1f4fa8; border-color: #1f4fa8; color: #fff; }
-  .asof { margin-left: auto; font-size: 12px; color: #888; white-space: nowrap; }
-
-  /* ── 리스트 표 ── */
-  .wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; border: 1px solid #c9ced6; }
-  table { border-collapse: collapse; width: 100%; min-width: 760px; font-size: 13px; }
-  th { background: #e9edf3; color: #333; font-weight: 600; padding: 6px 6px; border: 1px solid #d3d8df;
-       white-space: nowrap; text-align: center; }
-  td { padding: 6px 6px; border: 1px solid #e3e6ea; white-space: nowrap; text-align: right;
-       font-variant-numeric: tabular-nums; }
-  td.rk { text-align: center; color: #888; width: 34px; }
-  td.cd { text-align: left; color: #333; }
-  td.nm { text-align: left; font-weight: 600; color: #111; max-width: 190px; overflow: hidden; text-overflow: ellipsis; }
-  td.nm .sub { display: none; font-size: 11px; font-weight: 400; color: #999; }
-  tbody tr { cursor: pointer; }
-  tbody tr:nth-child(even) td { background: #fafbfc; }
-  tbody tr:hover td { background: #eef4ff; }
-  tbody tr.pick td { background: #dbe7ff !important; }
-  .up { color: #e5484d; }  .dn { color: #1a56db; }  .eq { color: #333; }
-
-  /* ── 핸드폰: 코드 칸은 숨기고 이름 아래 작게, 순위·종목명은 옆으로 밀어도 고정 ── */
-  @media (max-width: 600px) {
-    .tab { min-width: 80px; padding: 7px 10px; font-size: 15px; }
-    table { min-width: 620px; font-size: 13px; }
-    th.cd, td.cd { display: none; }
-    td.nm .sub { display: block; }
-    td.nm { max-width: 118px; }
-    th.rk, td.rk { position: sticky; left: 0; z-index: 2; background: #fff; }
-    th.nm, td.nm { position: sticky; left: 34px; z-index: 2; background: #fff; box-shadow: 1px 0 0 #d3d8df; }
-    th.rk, th.nm { background: #e9edf3; }
-    tbody tr:nth-child(even) td.rk, tbody tr:nth-child(even) td.nm { background: #fafbfc; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #ffffff;
+    overflow: hidden;
+    touch-action: pan-y;          /* 브라우저 화면 확대(핀치) 방지 */
   }
-
-  /* 차트로 넘어가는 동안 안내 */
-  #loading { display: none; position: fixed; left: 50%; top: 60px; transform: translateX(-50%); z-index: 9;
-             background: #222; color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 14px; }
+  #wrap {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    overflow: hidden;             /* 넘치는 아래쪽 부분을 잘라냄 */
+    background: #ffffff;
+  }
+  #app {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%;
+    height: calc(100% + var(--crop));   /* 화면보다 크게 만들어 하단 요소를 화면 밖으로 밀어냄 */
+    border: 0;
+  }
 </style>
 </head>
 <body>
-  <div class="top">
-    <button class="tab" data-m="KOSPI">코스피</button>
-    <button class="tab" data-m="KOSDAQ">코스닥</button>
-    <span class="asof" id="asof"></span>
+  <div id="wrap">
+    <iframe id="app"
+            src="https://여기에-앱주소.streamlit.app/?embed=true"
+            title="코스피·코스닥 TOP80 차트"
+            allow="fullscreen"></iframe>
   </div>
-  <div class="wrap">
-    <table>
-      <thead>
-        <tr>
-          <th class="rk">순위</th><th class="cd">종목코드</th><th class="nm">종목명</th>
-          <th>현재가</th><th>대비</th><th>등락률</th><th>시가</th><th>고가</th><th>저가</th>
-        </tr>
-      </thead>
-      <tbody id="body"></tbody>
-    </table>
-  </div>
-  <div id="loading">차트를 불러오는 중입니다…</div>
-
-<script>
-// ── Streamlit 과 주고받는 부분 ──
-function send(type, data) {
-  window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*");
-}
-function setHeight() {
-  send("streamlit:setFrameHeight", { height: Math.ceil(document.documentElement.scrollHeight) + 2 });
-}
-
-var DATA = { KOSPI: [], KOSDAQ: [] }, cur = null;
-
-function esc(s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
-  return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
-function n0(v) { return (v == null || !isFinite(v)) ? "-" : Number(v).toLocaleString("ko-KR", { maximumFractionDigits: 0 }); }
-function cls(v, base) {           // 전일 종가(base)보다 높으면 빨강, 낮으면 파랑
-  if (v == null || base == null || !isFinite(v) || !isFinite(base)) return "eq";
-  return v > base ? "up" : (v < base ? "dn" : "eq");
-}
-
-function render() {
-  document.querySelectorAll(".tab").forEach(function (b) { b.classList.toggle("on", b.dataset.m === cur); });
-  var rows = DATA[cur] || [], h = [];
-  for (var i = 0; i < rows.length; i++) {
-    var r = rows[i], code = r[0], name = r[1], close = r[2], chg = r[3], pct = r[4];
-    var prev = (close != null && chg != null) ? close - chg : null;      // 전일 종가
-    var c = pct > 0 ? "up" : (pct < 0 ? "dn" : "eq");
-    var arrow = pct > 0 ? "▲ " : (pct < 0 ? "▼ " : "");
-    var pctTxt = (pct == null) ? "-" : ((pct > 0 ? "+" : "") + Number(pct).toFixed(2) + "%");
-    h.push('<tr data-i="' + i + '">' +
-      '<td class="rk">' + (i + 1) + '</td>' +
-      '<td class="cd">' + esc(code) + '</td>' +
-      '<td class="nm">' + esc(name) + '<span class="sub">' + esc(code) + '</span></td>' +
-      '<td class="' + c + '">' + n0(close) + '</td>' +
-      '<td class="' + c + '">' + arrow + n0(chg == null ? null : Math.abs(chg)) + '</td>' +
-      '<td class="' + c + '">' + pctTxt + '</td>' +
-      '<td class="' + cls(r[5], prev) + '">' + n0(r[5]) + '</td>' +
-      '<td class="' + cls(r[6], prev) + '">' + n0(r[6]) + '</td>' +
-      '<td class="' + cls(r[7], prev) + '">' + n0(r[7]) + '</td>' +
-      '</tr>');
-  }
-  if (!rows.length) h.push('<tr><td colspan="9" style="text-align:center;color:#888;padding:20px">목록이 없습니다.</td></tr>');
-  document.getElementById("body").innerHTML = h.join("");
-  setHeight();
-}
-
-// 코스피 / 코스닥 버튼: 화면 안에서 바로 바뀜(다시 불러오지 않음)
-document.querySelectorAll(".tab").forEach(function (b) {
-  b.addEventListener("click", function () { cur = b.dataset.m; render(); });
-});
-
-// 종목을 누르면 → 파이썬에 종목 정보를 보내 차트 화면으로
-document.getElementById("body").addEventListener("click", function (e) {
-  var tr = e.target.closest("tr[data-i]");
-  if (!tr) return;
-  var r = (DATA[cur] || [])[+tr.dataset.i];
-  if (!r) return;
-  tr.classList.add("pick");
-  document.getElementById("loading").style.display = "block";
-  send("streamlit:setComponentValue", {
-    value: { code: r[0], name: r[1], mkt: cur, t: Date.now() },
-    dataType: "json"
-  });
-});
-
-window.addEventListener("message", function (ev) {
-  var d = ev.data;
-  if (!d || d.type !== "streamlit:render") return;
-  var a = d.args || {};
-  DATA = { KOSPI: a.kospi || [], KOSDAQ: a.kosdaq || [] };
-  if (cur === null) cur = (a.market === "KOSDAQ") ? "KOSDAQ" : "KOSPI";   // 기본값 코스피
-  document.getElementById("asof").textContent = a.asof ? ("기준 " + a.asof) : "";
-  render();
-});
-window.addEventListener("resize", setHeight);
-
-send("streamlit:componentReady", { apiVersion: 1 });
-</script>
+  <noscript>이 화면을 보려면 자바스크립트가 필요합니다.</noscript>
 </body>
 </html>
