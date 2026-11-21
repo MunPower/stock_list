@@ -1,0 +1,708 @@
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import FinanceDataReader as fdr
+import json
+import html
+from concurrent.futures import ThreadPoolExecutor
+import re
+import streamlit.components.v1 as components
+from pathlib import Path
+
+st.set_page_config(page_title="코스피·코스닥 TOP80 차트", layout="wide", initial_sidebar_state="collapsed")
+st.markdown("""<style>
+.block-container{padding:0.8rem 0.4rem 1rem 0.4rem;max-width:100%;}
+header,[data-testid="stHeader"],[data-testid="stToolbar"],[data-testid="stDecoration"],footer,
+[data-testid="manage-app-button"],[class*="_profileContainer_"],[class*="viewerBadge"],[class*="_terminalButton_"],[class*="_gzau3_"]{display:none !important;}
+</style>""", unsafe_allow_html=True)
+
+# ───────────── 차트 계산 설정(고정값) ─────────────
+disp, calc, lam, kmul, band_pct = 120, 720, 8e3, 1.6, 0.0
+
+
+# ───────────── 화면 상태 (list = 종목 리스트, chart = 차트) ─────────────
+ss = st.session_state
+ss.setdefault("view", "list")        # 처음 화면은 리스트
+ss.setdefault("market", "KOSPI")     # 리스트 기본값은 코스피
+ss.setdefault("nonce", 0)            # 목록으로 돌아올 때마다 리스트 화면을 새로 만들기 위한 번호
+ss.setdefault("last_t", None)        # 이미 처리한 클릭인지 구분
+
+# 리스트 화면(클릭하면 파이썬으로 종목을 알려주는 작은 화면) — stock_list/index.html
+_stock_list = components.declare_component("stock_list", path=str(Path(__file__).parent / "stock_list"))
+
+TOP_N = 80   # 시가총액 상위 몇 등까지 보여줄지
+
+
+def _num(v):
+    """'1,234' / '-1.5' / NaN 등을 숫자(또는 None)로"""
+    try:
+        f = float(str(v).replace(",", "").replace("%", "").strip())
+        return f if np.isfinite(f) else None
+    except Exception:
+        return None
+
+
+def _row(code, name, close, chg, ratio, opn, high, low):
+    """리스트 한 줄: [코드, 이름, 현재가, 대비(부호 포함), 등락률, 시가, 고가, 저가]"""
+    c, r = _num(close), _num(ratio)
+    d = _num(chg)
+    if d is not None and r is not None:      # 대비의 부호는 등락률 부호로 맞춤(상승 +, 하락 -)
+        d = abs(d) * (1 if r > 0 else (-1 if r < 0 else 0))
+    return [str(code), str(name), c, d, r, _num(opn), _num(high), _num(low)]
+
+
+def _from_fdr(n):
+    d = fdr.StockListing("KRX")
+    if "Marcap" not in d.columns:
+        raise ValueError("시가총액 정보 없음")
+    cc = "Code" if "Code" in d.columns else "Symbol"
+    rc = next((c for c in ("ChagesRatio", "ChangesRatio", "ChangeRatio") if c in d.columns), None)
+    mk = d["Market"].astype(str).str.upper()
+    out = {}
+    for m in ("KOSPI", "KOSDAQ"):
+        s = d[mk.str.startswith("KOSDAQ")] if m == "KOSDAQ" else d[mk == "KOSPI"]
+        s = s.assign(_mc=pd.to_numeric(s["Marcap"], errors="coerce")).sort_values("_mc", ascending=False).head(n)
+        out[m] = [_row(r[cc], r["Name"], r.get("Close"), r.get("Changes"), r.get(rc) if rc else None,
+                       r.get("Open"), r.get("High"), r.get("Low")) for _, r in s.iterrows()]
+    if not out["KOSPI"] or not out["KOSDAQ"]:
+        raise ValueError("빈 목록")
+    return out
+
+
+def _from_naver(n):
+    import requests
+    out = {}
+    for m in ("KOSPI", "KOSDAQ"):
+        r = requests.get(f"https://m.stock.naver.com/api/stocks/marketValue/{m}",
+                         params={"page": 1, "pageSize": n}, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        rows = []
+        for s in r.json().get("stocks", [])[:n]:
+            rows.append(_row(s.get("itemCode"), s.get("stockName"), s.get("closePrice"),
+                             s.get("compareToPreviousClosePrice"), s.get("fluctuationsRatio"),
+                             s.get("openPrice"), s.get("highPrice"), s.get("lowPrice")))
+        out[m] = rows
+    if not out["KOSPI"] or not out["KOSDAQ"]:
+        raise ValueError("빈 목록")
+    return out
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def top_lists(n: int = TOP_N):
+    """코스피·코스닥 시가총액 1~n위. 2분 동안은 저장해 둔 목록을 그대로 사용"""
+    asof = pd.Timestamp.now(tz="Asia/Seoul").strftime("%m-%d %H:%M")
+    for f in (_from_fdr, _from_naver):            # 먼저 FinanceDataReader, 안 되면 네이버에서 받기
+        try:
+            return f(n), asof
+        except Exception:
+            continue
+    return {"KOSPI": [], "KOSDAQ": []}, asof
+
+
+def history_js(view: str):
+    """폰의 '뒤로' 동작(제스처/버튼)으로도 차트 → 리스트로 돌아가게 함"""
+    components.html("""<script>
+(function(){
+  try{
+    var w=window.parent, view=%s;
+    if(!w.__chartBackInit){
+      w.__chartBackInit=true;
+      w.addEventListener('popstate',function(){
+        if(!w.__inChart)return;
+        w.__inChart=false;
+        var bs=w.document.querySelectorAll('button');
+        for(var i=0;i<bs.length;i++){ if((bs[i].innerText||'').indexOf('목록으로')>=0){ bs[i].click(); break; } }
+      });
+    }
+    if(view==='chart' && !w.__inChart){ w.__inChart=true; w.history.pushState({chart:1},''); }
+    if(view==='list' && w.__inChart){ w.__inChart=false; w.history.back(); }   // 화면의 ← 버튼으로 돌아온 경우
+  }catch(e){}
+})();
+</script>""" % json.dumps(view), height=0)
+
+
+# ───────────── ① 리스트 화면 ─────────────
+if ss.view == "list":
+    history_js("list")
+    with st.spinner("코스피·코스닥 시가총액 순위를 불러오는 중입니다…"):
+        lists, asof = top_lists()
+    if not lists["KOSPI"] and not lists["KOSDAQ"]:
+        st.error("종목 리스트를 불러오지 못했습니다. 잠시 후 새로고침해 주세요.")
+        st.stop()
+    val = _stock_list(kospi=lists["KOSPI"], kosdaq=lists["KOSDAQ"], market=ss.market, asof=asof,
+                      key=f"stock_list_{ss.nonce}", default=None)
+    if isinstance(val, dict) and val.get("t") and val.get("t") != ss.last_t:   # 종목을 눌렀음 → 차트로
+        ss.last_t = val["t"]
+        ss.code = str(val.get("code"))
+        ss.name = str(val.get("name") or ss.code)
+        ss.mkt = "KOSDAQ" if val.get("mkt") == "KOSDAQ" else "KOSPI"
+        ss.market = ss.mkt                       # 돌아왔을 때 같은 탭(코스피/코스닥)을 보여줌
+        ss.view = "chart"
+        st.rerun()
+    st.stop()
+
+
+# ───────────── ② 차트 화면 (주식001 차트) ─────────────
+st.markdown("""<style>
+div.stButton > button{padding:2px 14px;min-height:0;font-size:15px;font-weight:600;border-radius:6px;}
+</style>""", unsafe_allow_html=True)
+if st.button("← 목록으로", key="back_btn"):
+    ss.view = "list"
+    ss.nonce += 1
+    st.rerun()
+history_js("chart")
+
+code, name, mkt = ss.code, ss.name, ss.mkt
+name_ph = st.empty()
+name_ph.markdown(
+    f'<div style="font-size:20px;font-weight:700;line-height:1.3">{html.escape(str(name))} '
+    f'<span style="font-size:13px;color:#888;font-weight:400">{html.escape(code)}</span></div>',
+    unsafe_allow_html=True)
+
+# 시세를 받는 동안 "고장난 것처럼" 보이지 않도록 안내 표시 (차트가 나오면 사라짐)
+status = st.empty()
+status.markdown(
+    '<div style="padding:10px 12px;border-radius:8px;background:#fff4dc;color:#8a5a00;font-size:14px;line-height:1.5">'
+    '⏳ 시세를 불러오는 중입니다. 처음 한 번은 20~30초 걸릴 수 있어요. 잠시만 기다려 주세요.</div>',
+    unsafe_allow_html=True)
+
+@st.cache_data(ttl=30, show_spinner=False)
+def live_index(sym: str):
+    """네이버에서 지수 현재값(장중이면 실시간, 장 마감 후엔 종가)을 받는다. 실패하면 None"""
+    import requests
+    try:
+        r = requests.get(f"https://m.stock.naver.com/api/index/{'KOSDAQ' if sym == 'KQ11' else 'KOSPI'}/basic",
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=4)
+        j = r.json()
+        val = float(str(j["closePrice"]).replace(",", ""))
+        day = pd.Timestamp(str(j.get("localTradedAt", ""))[:10]).normalize()
+        return day, val
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_both(code: str, idx_sym: str, days: int):
+    """종목과 지수 시세를 동시에 받아 온다. 지수는 8초 안에 못 받으면 None(차트는 지수선 없이 표시)"""
+    start = (pd.Timestamp.today() - pd.Timedelta(days=int(days * 1.6) + 10)).strftime("%Y-%m-%d")
+    ex = ThreadPoolExecutor(max_workers=2)
+    f_stock = ex.submit(fdr.DataReader, code, start)
+    f_idx = ex.submit(fdr.DataReader, idx_sym, start)
+    try:
+        stock = f_stock.result(timeout=40).tail(int(days))
+        try:
+            idx = f_idx.result(timeout=8).tail(int(days))
+        except Exception:
+            idx = None
+        return stock, idx
+    finally:
+        ex.shutdown(wait=False)
+
+
+def hp_trend(z: np.ndarray, lam: float) -> np.ndarray:
+    """Hodrick-Prescott 필터의 추세 성분: (I + λ D'D) τ = z"""
+    n = len(z)
+    D = np.zeros((n - 2, n))
+    for i in range(n - 2):
+        D[i, i:i + 3] = [1, -2, 1]
+    return np.linalg.solve(np.eye(n) + lam * D.T @ D, z)
+
+
+calc = max(int(calc), 180)
+idx_sym, idx_name = ("KQ11", "코스닥") if mkt == "KOSDAQ" else ("KS11", "코스피")
+try:
+    df, _idf = load_both(code.strip(), idx_sym, calc)
+except Exception as e:
+    status.empty()
+    st.error(f"데이터를 불러오지 못했습니다: {e}")
+    st.stop()
+if df.empty or len(df) < 60:
+    status.empty()
+    st.warning("데이터가 부족합니다(60개 이상 필요). 종목코드를 확인하세요.")
+    st.stop()
+
+y = df["Close"].to_numpy(dtype=float)
+n = len(y)
+t = np.arange(n)
+
+# 직선추세: 계산기간 전체에 대한 1차 선형회귀
+b1, b0 = np.polyfit(t, y, 1)
+line = b0 + b1 * t
+# 곡선추세: 직선추세 제거 → HP필터 평활화 → 직선추세 복원
+curve = line + hp_trend(y - line, lam)
+# 상·하한: 곡선 대비 비율 변동성 기준 (곡선 × (1 ± kσ))
+rel = y / curve - 1
+sd_rel = rel.std()
+width = band_pct / 100 if band_pct > 0 else kmul * sd_rel
+upper, lower = curve * (1 + width), curve * (1 - width)
+
+# 화면에는 최근 disp일만 표시
+D = n
+init_span = int(min(disp, D))
+sl = slice(n - D, n)
+dates = df.index.strftime("%Y-%m-%d")[sl]
+yv, curvev, upv, lov = y[sl], curve[sl], upper[sl], lower[sl]
+def _ohl(c):   # 시가·고가·저가가 비어 있으면 종가로 대신 채움
+    a = df[c].to_numpy(dtype=float)[sl] if c in df.columns else yv.copy()
+    return np.where(np.isfinite(a) & (a > 0), a, yv)
+ov, hv, lv = _ohl("Open"), _ohl("High"), _ohl("Low")
+hv, lv = np.maximum.reduce([hv, ov, yv]), np.minimum.reduce([lv, ov, yv])
+
+# ───────────── 지수(코스피/코스닥) 비교선 ─────────────
+idx_arr = None
+_live_ok = False
+try:
+    _s = _idf["Close"].reindex(df.index).ffill().bfill()
+    _live = live_index(idx_sym)                 # 종목처럼 접속할 때마다 최신 지수값으로 갱신
+    if _live is not None and _live[0] >= df.index[-1].normalize():
+        _s.iloc[-1] = _live[1]
+        _live_ok = True
+    if len(_s) == n and np.isfinite(_s.to_numpy(dtype=float)).all():
+        idx_arr = _s.to_numpy(dtype=float)
+except Exception:
+    idx_arr = None
+idx_note = ""
+if idx_arr is not None:     # 지수 데이터가 종목보다 며칠 일찍 끝나면 알려줌 (마지막 값으로 채워졌다는 뜻)
+    _gap = (df.index.max() - _idf.index.max()).days
+    if _gap >= 1 and not _live_ok:
+        idx_note = f"※ {idx_name} 데이터가 {_idf.index.max():%Y-%m-%d}까지만 있어 최근 {_gap}일은 마지막 값으로 채웠습니다."
+idx_scaled = None
+if idx_arr is not None:     # 처음 열었을 때 맨 왼쪽 종가에 한 번만 맞춘 뒤 고정 (밀거나 확대해도 변하지 않음)
+    idx_scaled = idx_arr * (yv[n - init_span] / idx_arr[n - init_span])
+PHONE_SPAN_PY = min(42, init_span)
+idx_scaled_p = None
+if idx_scaled is not None:  # 폰은 처음 2달치만 보이므로 그 맨 왼쪽 종가에 맞춘 지수선도 따로 준비
+    idx_scaled_p = idx_arr * (yv[n - PHONE_SPAN_PY] / idx_arr[n - PHONE_SPAN_PY])
+
+# ───────────── 상단 시세 헤더 ─────────────
+last, prev = y[-1], y[-2]
+chg = last - prev
+pct = chg / prev * 100
+col = "#e5484d" if chg > 0 else ("#3b6fd4" if chg < 0 else "#333333")
+arrow = "▲" if chg > 0 else ("▼" if chg < 0 else "-")
+vol = df["Volume"].iloc[-1]
+
+# ───────────── 종목명 옆: 기준 날짜 + 지수 ─────────────
+if idx_arr is not None:
+    name_ph.markdown(
+        f'<div style="display:flex;align-items:baseline;gap:18px;flex-wrap:wrap">'
+        f'<div style="font-size:20px;font-weight:700;line-height:1.3">{html.escape(str(name))} '
+        f'<span style="font-size:13px;color:#888;font-weight:400">{html.escape(code)}</span></div>'
+        f'<div style="font-size:17px;font-weight:700;color:#0aa05a">'
+        f'● {df.index[-1]:%Y-%m-%d} {idx_name} {idx_arr[-1]:,.2f}</div>'
+        '</div>',
+        unsafe_allow_html=True)
+
+# ───────────── 매수·매도 표시 (현재가가 곡선추세 상·하한에 닿거나 넘었을 때) ─────────────
+TOUCH_TOL = 0          # 0 = 상·하한에 정확히 닿거나 넘었을 때만 표시
+_up, _lo = float(upper[-1]), float(lower[-1])
+sig_html = ""
+if last >= _up * (1 - TOUCH_TOL):          # 상한에 닿거나 위로 넘음 → 파란색 매도
+    sig_html = '<div style="font-size:40px;font-weight:800;color:#1a56db;line-height:1">매도</div>'
+elif last <= _lo * (1 + TOUCH_TOL):        # 하한에 닿거나 아래로 내려감 → 빨간색 매수
+    sig_html = '<div style="font-size:40px;font-weight:800;color:#e5484d;line-height:1">매수</div>'
+
+_sig = ""
+if sig_html:
+    _sig_txt, _sig_col = ("매도 가능합니다", "#1a56db") if "매도" in sig_html else ("매수 가능합니다", "#e5484d")
+    _sig = f'<div class="hd-sig" style="color:{_sig_col}">{_sig_txt}</div>'
+st.markdown(
+    '<style>'
+    '.hd-row{display:flex;align-items:center;gap:16px;flex-wrap:nowrap}'
+    '.hd-px{display:flex;flex-direction:column;align-items:flex-start;gap:4px}'
+    '.hd-big{font-size:42px;font-weight:700;line-height:1}'
+    '.hd-chg{font-size:16px}'
+    '.hd-lines{display:flex;flex-direction:column;gap:10px}'
+    '.hd-lbl{font-size:15px;color:#111;line-height:1.4;text-align:center;white-space:nowrap}'
+    '.hd-sig{font-size:24px;font-weight:800;line-height:1.2;white-space:nowrap}'
+    '@media (max-width:600px){'
+    '.hd-row{gap:10px}.hd-big{font-size:30px}.hd-chg{font-size:14px}'
+    '.hd-lbl{font-size:12px}.hd-sig{font-size:17px}}'
+    '</style>'
+    '<div class="hd-row">'
+    '<div>'
+    f'<div class="hd-px"><span class="hd-big" style="color:{col}">{last:,.0f}</span>'
+    f'<span class="hd-chg" style="color:{col}">{arrow} {abs(chg):,.0f} &nbsp; {pct:+.2f}%</span></div>'
+    f'<div style="font-size:13px;color:#888;margin-top:6px">거래량 {vol:,.0f}</div>'
+    '</div>'
+    '<div class="hd-lines">'
+    f'<div class="hd-lbl" data-ul="1" style="color:#1a56db;font-weight:600">매도선<br>(<span data-k="u">{_up:,.0f}</span>)</div>'
+    f'<div class="hd-lbl" data-ul="1" style="color:#e5484d;font-weight:600">매수선<br>(<span data-k="l">{_lo:,.0f}</span>)</div>'
+    '</div>'
+    f'{_sig}'
+    '</div>',
+    unsafe_allow_html=True)
+
+# ───────────── 차트 ─────────────
+def direction_colors(v):
+    d = np.diff(v, prepend=v[1])
+    d[0] = d[1]
+    return np.where(d >= 0, "#e5484d", "#3b6fd4")  # 상승=빨강, 하락=파랑
+
+
+def base_traces(fig):
+    fig.add_trace(go.Candlestick(x=dates, open=ov, high=hv, low=lv, close=yv, name="수정종가", showlegend=False,
+                                 increasing=dict(line=dict(color="#e5484d", width=1), fillcolor="#e5484d"),
+                                 decreasing=dict(line=dict(color="#3b6fd4", width=1), fillcolor="#3b6fd4")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=curvev, name="곡선추세", line=dict(color="#111111", width=1.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=upv, name="매도선", line=dict(color="#1a56db", width=2.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=lov, name="매수선", line=dict(color="#e5484d", width=2.2)), row=1, col=1)
+    if idx_scaled is not None:   # 4번 트레이스: 지수(녹색 점선)
+        fig.add_trace(go.Scatter(x=dates, y=idx_scaled, name=idx_name,
+                                 line=dict(color="#00a651", width=3, dash="dot")), row=1, col=1)
+        if idx_scaled_p is not None:   # 5번 트레이스: 폰용 지수선(처음엔 숨김, 폰이면 JS가 이것으로 교체)
+            fig.add_trace(go.Scatter(x=dates, y=idx_scaled_p, name=idx_name, visible=False, showlegend=False,
+                                     line=dict(color="#00a651", width=3, dash="dot")), row=1, col=1)
+
+
+CROSSHAIR_JS = """
+function installCrosshair(gd, initSpan, S, B, IDX, IT, IDXNAME, IDXRAW, OPEN, LOW, ANCH, IDX2, IT2, HIGH){
+  var LP_MS=500;           // 길게 눌러 진동이 오기까지의 시간(ms)
+  var CROSS_DELAY_MS=150;  // 진동 후 십자선이 나타나기까지의 시간(ms) (진동 → 십자선 순서 맞춤)
+  var PAN_GAIN=1.5;        // 손가락 이동 속도 배율
+  var ZOOM_GAIN=1.5;       // 확대/축소 속도 배율
+  var COMPARE_MODE='level'; // 'level'=그날 종목 가격과 그날 지수선(녹색 점선) 비교, 'daily'=그날 등락률끼리 비교
+  var SAME_BAND_LEVEL=2;    // level: 가격 차이가 ±2% 이내면 '보합'
+  var SAME_BAND_DAILY=0.3;  // daily: 등락률 차이가 ±0.3%p 이내면 '보합'
+  var idxOn=true;          // 지수 비교선 표시 여부
+  var RPAD_RATIO=0.08;     // 오른쪽 여백: 보이는 기간의 8%만큼 빈 칸 (120일 → 약 10칸, 폰 42일 → 약 3칸)
+  var RPAD_MIN=3;          // 오른쪽 여백 최소 칸 수
+  // 브라우저(앱 브라우저)가 두 손가락으로 화면 전체를 확대하지 못하게 막기
+  try{
+    var pd=window.parent.document, mv=pd.querySelector('meta[name=viewport]');
+    if(mv)mv.setAttribute('content','width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no');
+    if(!pd.getElementById('nozoom_css')){
+      var st=pd.createElement('style'); st.id='nozoom_css';
+      st.textContent='iframe{touch-action:pan-y !important;}'; pd.head.appendChild(st);
+    }
+  }catch(err){}
+  gd.style.position='relative'; gd.style.touchAction='pan-y';
+  gd.style.userSelect='none'; gd.style.webkitUserSelect='none';
+  gd.style.webkitTouchCallout='none'; gd.style.webkitTapHighlightColor='transparent';
+  var cats=gd.data[0].x, N=cats.length, MINS=Math.min(20,N), MAXS=Math.min(Math.max(120,initSpan),N);
+  function clampSpan(v){return Math.round(Math.max(MINS,Math.min(MAXS,v)));}
+  function clampI0(v,sp){return Math.round(Math.max(0,Math.min(N-sp,v)));}
+  // 핸드폰(화면 폭 600px 이하)은 처음에 약 2달(42거래일)만 확대해서 보여줌. PC는 그대로.
+  var PHONE_SPAN=42, ITa=IT;
+  var isPhone=false;
+  try{ isPhone=Math.min(window.screen&&window.screen.width||9999, window.innerWidth||9999)<=600; }catch(e0){}
+  if(isPhone && initSpan>PHONE_SPAN && IDX && IDX2 && IDX2.length===N){
+    try{   // 폰: 2달치 기준으로 미리 환산해 둔 지수선으로 교체(보이기/숨기기만 사용)
+      IDX=IDX2; ITa=IT2; initSpan=PHONE_SPAN;
+      var pr0=Plotly.restyle(gd,{visible:[false]},[IT]); if(pr0&&pr0.then)pr0.then(null,function(){});
+      var pr1=Plotly.restyle(gd,{visible:[true]},[IT2]); if(pr1&&pr1.then)pr1.then(null,function(){});
+    }catch(e1){}
+  } else if(isPhone && initSpan>PHONE_SPAN){ initSpan=PHONE_SPAN; }
+  var span=clampSpan(initSpan), i0=N-span;
+  var pending=false, mode=null, timer=null, sx=0, sy=0, startI0=0, lastT=null, mdown=false, pinch=null, markersOn=null;
+  var tStart=0, lastTap=0, lastTouch=0;
+
+  function mk(css){var d=document.createElement('div');
+    d.style.cssText='position:absolute;pointer-events:none;display:none;z-index:50;'+css;
+    gd.appendChild(d);return d;}
+  var lab='background:#222;color:#fff;font:11px sans-serif;padding:2px 4px;white-space:nowrap;';
+  var vl=mk('width:0;border-left:1px solid #333;');
+  var hl=mk('height:0;border-top:1px solid #333;');
+  var dl=mk(lab+'transform:translateX(-50%);white-space:pre;text-align:center;line-height:1.3;');   // 날짜 + (가격 , 지수) 두 줄
+  var pr=mk(lab+'width:50px;transform:translateY(-50%);');
+  function f2(v){return Number(v).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
+  var sm=mk('left:4px;top:6px;font:600 12px sans-serif;white-space:nowrap;');   // 지수 대비 요약
+  var dt=mk('left:4px;top:24px;font:11px sans-serif;color:#666;white-space:nowrap;');   // 계산 근거(기준일부터의 수익률)
+  var ig=mk('left:4px;top:40px;font:600 11px sans-serif;color:#00a651;white-space:nowrap;');   // 지수 값(녹색)
+  if(IDX){sm.style.display='block'; dt.style.display='block'; ig.style.display='block';}
+  var focus=N-1;           // 십자선이 가리키는 날짜(없으면 맨 오른쪽=최근)
+  function sg(v){return (v>=0?'+':'')+v.toFixed(1)+'%';}
+  function md(i){return cats[i].slice(5);}
+  function pxs(v){return Number(v).toLocaleString('en-US',{maximumFractionDigits:0});}
+  function updateSummary(){   // 선택한 날짜(없으면 최근 날짜)의 종목 가격과 지수로 강함/약함/보합 판단
+    var D0=focus;
+    try{
+      var su=window.parent.document.querySelectorAll('[data-k=u]'), sl2=window.parent.document.querySelectorAll('[data-k=l]');
+      for(var q=0;q<su.length;q++)su[q].textContent=pxs(S[2][D0]);
+      for(var q2=0;q2<sl2.length;q2++)sl2[q2].textContent=pxs(S[3][D0]);}catch(e2){}
+    if(!IDX)return;
+    var R=IDXRAW||IDX, D=focus, d, band, row2, unit;
+    if(COMPARE_MODE==='daily' && D>=1){
+      var sr=(S[0][D]/S[0][D-1]-1)*100, ir=(R[D]/R[D-1]-1)*100;
+      d=sr-ir; band=SAME_BAND_DAILY; unit='%p ';
+      row2='그날 등락 종목 '+sg(sr)+' · '+IDXNAME+' '+sg(ir);
+    } else {
+      d=(S[0][D]/IDX[D]-1)*100; band=SAME_BAND_LEVEL; unit='% ';     // 종목 가격이 지수선보다 몇 % 위/아래인지
+      // 시가·저가·종가는 전일 종가 대비, 지수선은 전일 지수선 대비 등락률
+      var prevClose = D > 0 ? S[0][D-1] : NaN;
+      var prevIndex = D > 0 ? IDX[D-1] : NaN;
+      function coloredValue(label, value, base, pctSourceValue){
+        // pctSourceValue가 있으면 실제 원본 지수값으로 등락률을 계산
+        var compareValue = (pctSourceValue !== undefined) ? pctSourceValue : value;
+        var pct = (isFinite(base) && base !== 0 && isFinite(compareValue))
+                    ? (compareValue / base - 1) * 100 : NaN;
+        var color = !isFinite(pct) || Math.abs(pct) < 0.0000001 ? '#000000' : (pct > 0 ? '#e5484d' : '#3b6fd4');
+        var pctText = isFinite(pct) ? (pct > 0 ? '+' : '') + pct.toFixed(2) + '%' : '—';
+        return '<span style="color:'+color+'">'+label+' '+pxs(value)+' ('+pctText+')</span>';
+      }
+      var prevRawIndex = D > 0 ? R[D-1] : NaN;
+      row2 = '<span style="color:#000000">시가 '+pxs(OPEN[D])+'</span> · ' +
+       '<span style="color:#000000">저가 '+pxs(LOW[D])+'</span> · ' +
+       '<span style="color:#000000">종가 '+pxs(S[0][D])+'</span> · ' +
+       coloredValue('지수', R[D], prevRawIndex);
+    }
+    var up=d>band, dn=d<-band;
+    sm.textContent=IDXNAME+' 대비 '+(d>=0?'+':'')+d.toFixed(1)+unit+(up?'강함':(dn?'약함':'보합'));
+    sm.style.color=up?'#e5484d':(dn?'#3b6fd4':'#666');
+    if(COMPARE_MODE==='daily'){
+      dt.textContent=row2;
+    } else {
+      dt.innerHTML=row2;
+    }
+    ig.textContent='● '+cats[D]+'  '+IDXNAME+' '+f2(R[D]);
+  }
+  var tg=null;
+  var dbg=mk('left:4px;top:66px;font:11px sans-serif;color:#c00;background:rgba(255,255,255,.92);padding:2px 4px;max-width:92%;z-index:70;');
+  function showErr(e){dbg.style.display='block'; dbg.textContent='차트 오류: '+(e&&e.message?e.message:e);}
+  function hide(){[vl,hl,dl,pr].forEach(function(e){e.style.display='none';}); if(focus!==N-1){focus=N-1; updateSummary();}}
+
+  function fmt(c){return c.slice(5).replace('-','.');}
+
+  // 보이는 구간의 최고/최저에 맞춰 가격 범위를 즉시 변경 + 지수선을 맨 왼쪽 종가에 맞춰 환산
+  function draw(){
+    var a=Math.max(0,Math.floor(i0)), b=Math.min(N-1,Math.ceil(i0+span)-1), i, k, v;
+    var lo=Infinity, hi=-Infinity, bl=0, bh=0;
+    for(k=0;k<S.length;k++){for(i=a;i<=b;i++){v=S[k][i]; if(v<lo)lo=v; if(v>hi)hi=v;}}
+    if(IDX&&idxOn){for(i=a;i<=b;i++){v=IDX[i]; if(v<lo)lo=v; if(v>hi)hi=v;}}
+    if(HIGH&&LOW){for(i=a;i<=b;i++){if(HIGH[i]>hi)hi=HIGH[i]; if(LOW[i]<lo)lo=LOW[i];}}   // 캔들 고가·저가
+    for(i=a;i<=b;i++){v=B[i]; if(v<bl)bl=v; if(v>bh)bh=v;}
+    if(!isFinite(lo)||!isFinite(hi)||!isFinite(bl)||!isFinite(bh))throw new Error('가격 범위 계산 오류');
+    var pad=(hi-lo)*0.06||1;
+    var step=Math.max(3,Math.round(span/4)), tv=[], tt=[], idx;
+    for(idx=N-1;idx>=a;idx-=step){tv.push(cats[idx]); tt.push(fmt(cats[idx]));}
+    var rp=Math.max(RPAD_MIN,Math.round(span*RPAD_RATIO));   // 오늘 캔들이 오른쪽 끝에 붙지 않게 빈 칸 추가
+    var xr=[i0-0.5,i0+span-0.5+rp];
+    var lay={'xaxis.range':xr,'xaxis2.range':xr,
+      'yaxis.range':[lo-pad,hi+pad],'yaxis2.range':[bl*1.1,(bh*1.1)||1],
+      'xaxis.tickvals':tv,'xaxis.ticktext':tt,'xaxis2.tickvals':tv,'xaxis2.ticktext':tt};
+    var p=Plotly.relayout(gd,lay);
+    if(p&&p.then)p.then(null,showErr);
+  }
+  function render(){
+    pending=false;
+    try{ draw(); }
+    catch(e){                                // 지수 부분에서 문제가 생겨도 차트는 계속 그리도록 지수 기능만 끔
+      showErr(e);
+      if(IDX){
+        IDX=null; sm.style.display='none'; if(tg)tg.style.display='none';
+        try{ Plotly.restyle(gd,{visible:[false]},[ITa]); }catch(e1){}
+        try{ draw(); }catch(e2){ showErr(e2); }
+      }
+    }
+  }
+  function schedule(){if(!pending){pending=true;requestAnimationFrame(render);}}
+
+  function move(cx,cy){
+    var r=gd.getBoundingClientRect(), x=cx-r.left, y=cy-r.top;
+    var fl=gd._fullLayout, s=fl._size, xa=fl.xaxis, ya=fl.yaxis, yb=fl.yaxis2;
+    if(x<s.l||x>s.l+s.w||y<s.t||y>s.t+s.h){hide();return;}
+    var lo=xa.range[0], hi=xa.range[1];
+    var idx=Math.round((x-xa._offset)/xa._length*(hi-lo)+lo);
+    idx=Math.max(0,Math.min(N-1,idx));
+    focus=idx; updateSummary();
+    var xs=xa._offset+(idx-lo)/(hi-lo)*xa._length;
+    if(!isFinite(xs))return;
+    var ax=(y>=yb._offset)?yb:ya;
+    var v=ax.range[1]-(y-ax._offset)/ax._length*(ax.range[1]-ax.range[0]);
+    var txt=Math.round(v).toLocaleString('en-US');
+    vl.style.cssText+=';display:block;left:'+xs+'px;top:'+s.t+'px;height:'+s.h+'px;';
+    hl.style.cssText+=';display:block;left:'+s.l+'px;top:'+y+'px;width:'+s.w+'px;';
+    var showI=!!(IDX&&IDXRAW&&idxOn);
+    // 예) 2026-10-20 (줄바꿈) (11,700 , 5,600.00)  → 날짜 / (그날 종목 가격 , 그날 지수)
+    dl.textContent=cats[idx]+'\\n('+pxs(S[0][idx])+(showI?' , '+f2(IDXRAW[idx]):'')+')';
+    dl.style.display='block'; dl.style.top=(ya._offset+ya._length+2)+'px';
+    var half=(dl.offsetWidth||0)/2, tot=fl.width||gd.clientWidth||0;
+    dl.style.left=(tot?Math.max(half,Math.min(tot-half,xs)):xs)+'px';        // 화면 밖으로 나가지 않게
+    pr.style.display='block'; pr.style.left=(s.l+s.w+2)+'px'; pr.style.top=y+'px'; pr.textContent=txt;
+  }
+  function pxToBars(dx){return dx/gd._fullLayout._size.w*span;}
+  function fracOf(clientX){
+    var r=gd.getBoundingClientRect(), s=gd._fullLayout._size;
+    return Math.max(0,Math.min(1,(clientX-r.left-s.l)/s.w));
+  }
+  function dist(t){var dx=t[0].clientX-t[1].clientX, dy=t[0].clientY-t[1].clientY; return Math.sqrt(dx*dx+dy*dy);}
+  function resetView(){                       // 더블클릭/더블탭: 처음 상태로
+    span=clampSpan(initSpan); i0=N-span; pinch=null; if(mode==='cross')mode=null; hide(); schedule();
+  }
+  function zoomBy(factor){                    // 화면 가운데 기준 확대/축소
+    var c=i0+span/2, ns=clampSpan(span*factor);
+    if(ns===span)ns=clampSpan(span+(factor<1?-1:1));
+    span=ns; i0=clampI0(c-ns/2,ns); hide(); schedule();
+  }
+
+  // ── 확대/축소 버튼 (두 손가락 확대가 막히는 폰용) ──
+  function btn(txt,right,fn,w,fs){
+    var b=document.createElement('div'); b.textContent=txt;
+    b.style.cssText='position:absolute;top:2px;right:'+right+'px;width:'+(w||28)+'px;height:22px;line-height:22px;text-align:center;'
+      +'font:600 '+(fs||15)+'px sans-serif;background:#f3f3f3;border:1px solid #ccc;border-radius:4px;z-index:60;cursor:pointer;'
+      +'touch-action:manipulation;user-select:none;-webkit-user-select:none;';
+    ['touchstart','touchmove','touchend','mousedown','mousemove','dblclick'].forEach(function(n){
+      b.addEventListener(n,function(e){e.stopPropagation();},{passive:true});});
+    b.addEventListener('click',function(e){e.stopPropagation();fn();});
+    gd.appendChild(b);
+    return b;
+  }
+  btn('＋',92,function(){zoomBy(0.6);});
+  btn('－',62,function(){zoomBy(1/0.6);});
+  if(IDX){                                  // 지수 비교선 켜기/끄기 버튼 (버튼 글자 = 지수 이름)
+    tg=btn(IDXNAME,124,function(){idxOn=!idxOn; paintTg(); try{Plotly.restyle(gd,{visible:[idxOn]},[ITa]);}catch(e){showErr(e);} schedule();},46,12);
+    var paintTg=function(){tg.style.color=idxOn?'#007a3d':'#999'; tg.style.background=idxOn?'#e8f8ef':'#f3f3f3'; tg.style.borderColor=idxOn?'#00a651':'#ccc';};
+    paintTg();
+  }
+
+  // ── 손가락 ──
+  // 바로 좌우로 밀기=기간 이동(한 칸씩 딱딱하게) / 길게 눌러 진동=십자선 / 두 손가락=확대·축소
+  gd.addEventListener('touchstart',function(e){
+    clearTimeout(timer); lastTouch=Date.now();
+    if(e.touches.length>=2){
+      hide(); mode='pinch';
+      pinch={d:dist(e.touches),span:span,anchor:i0+fracOf((e.touches[0].clientX+e.touches[1].clientX)/2)*span};
+      return;
+    }
+    hide();
+    var t=e.touches[0]; lastT=t; sx=t.clientX; sy=t.clientY; startI0=i0; mode=null; tStart=Date.now();
+    timer=setTimeout(function(){
+      if(mode!==null)return;
+      mode='arming'; if(navigator.vibrate)navigator.vibrate(40);       // ① 진동
+      timer=setTimeout(function(){                                      // ② 잠깐 뒤 십자선 표시 후 따라다님
+        if(mode==='arming'){mode='cross'; move(lastT.clientX,lastT.clientY);}
+      },CROSS_DELAY_MS);
+    },LP_MS);
+  },{passive:true});
+  gd.addEventListener('touchmove',function(e){
+    if(mode==='pinch'){
+      if(e.touches.length===2&&pinch){
+        e.preventDefault();
+        var f=fracOf((e.touches[0].clientX+e.touches[1].clientX)/2);
+        var ns=clampSpan(pinch.span*Math.pow(pinch.d/dist(e.touches),ZOOM_GAIN));
+        span=ns; i0=clampI0(pinch.anchor-f*ns,ns); schedule();
+      }
+      return;
+    }
+    if(e.touches.length!==1)return;
+    var t=e.touches[0]; lastT=t;
+    if(mode==='arming'){e.preventDefault(); return;}
+    if(mode==='cross'){e.preventDefault(); move(t.clientX,t.clientY); return;}
+    if(mode==='pan'){e.preventDefault(); i0=clampI0(startI0-pxToBars(t.clientX-sx)*PAN_GAIN,span); schedule(); return;}
+    if(mode==='scroll')return;
+    var dx=t.clientX-sx, dy=t.clientY-sy;
+    if(Math.abs(dx)>6||Math.abs(dy)>6){
+      clearTimeout(timer);
+      if(Math.abs(dx)>Math.abs(dy)){mode='pan'; e.preventDefault(); i0=clampI0(startI0-pxToBars(dx)*PAN_GAIN,span); schedule();}
+      else mode='scroll';
+    }
+  },{passive:false});
+  function touchEnd(e){
+    clearTimeout(timer); lastTouch=Date.now();
+    if(e.touches&&e.touches.length>0)return;      // 아직 손가락이 남아 있음
+    pinch=null;
+    if(mode===null&&e.type==='touchend'&&Date.now()-tStart<300){   // 짧게 톡 → 두 번이면 기본값
+      var now=Date.now();
+      if(now-lastTap<350){resetView(); lastTap=0;} else lastTap=now;
+    }
+    if(mode!=='cross')mode=null;                   // 십자선은 손을 떼도 남고, 다음 터치 때 사라짐
+  }
+  gd.addEventListener('touchend',touchEnd);
+  gd.addEventListener('touchcancel',touchEnd);
+  gd.addEventListener('contextmenu',function(e){e.preventDefault();});
+
+  // ── PC: 마우스를 누른 채 끌면 이동, 그냥 움직이면 십자선, Ctrl+휠=확대/축소 ──
+  function emu(e){return (Date.now()-lastTouch<1000)||(e.sourceCapabilities&&e.sourceCapabilities.firesTouchEvents);}
+  gd.addEventListener('mousedown',function(e){if(emu(e))return; mdown=true; sx=e.clientX; startI0=i0; e.preventDefault();});
+  window.addEventListener('mousemove',function(e){
+    if(!mdown)return;
+    i0=clampI0(startI0-pxToBars(e.clientX-sx),span); schedule();
+  },true);
+  window.addEventListener('mouseup',function(){mdown=false;},true);
+  gd.addEventListener('mousemove',function(e){if(emu(e))return; move(e.clientX,e.clientY);});
+  gd.addEventListener('mouseleave',function(e){if(emu(e))return; hide();});
+  gd.addEventListener('dblclick',function(e){resetView();});
+  gd.addEventListener('wheel',function(e){
+    if(!e.ctrlKey)return; e.preventDefault();
+    var f=fracOf(e.clientX), anchor=i0+f*span;
+    var ns=clampSpan(span*(e.deltaY>0?1.23:0.81));
+    if(ns===span)ns=clampSpan(span+(e.deltaY>0?1:-1));
+    span=ns; i0=clampI0(anchor-f*ns,ns); schedule();
+  },{passive:false});
+  updateSummary();
+  render();
+}
+"""
+
+
+def finish(fig, low_label):
+    m = len(dates)
+    pos = sorted({m - 1 - int(round(i * (m - 1) / 3.6)) for i in range(4)})
+    fig.update_xaxes(type="category", tickmode="array",
+                     tickvals=[dates[i] for i in pos],
+                     ticktext=[pd.to_datetime(dates[i]).strftime("%m.%d") for i in pos],
+                     tickangle=0, tickfont=dict(size=11, color="#555"),
+                     showgrid=True, gridcolor="#f0b8b8", gridwidth=1,
+                     showline=False, zeroline=False)
+    fig.update_xaxes(showticklabels=True, row=1, col=1)    # 날짜는 위 차트 아래(두 차트 사이)에 표시
+    fig.update_xaxes(showticklabels=False, row=2, col=1)
+    fig.update_yaxes(side="right", tickformat=",.0f", tickfont=dict(size=11, color="#555"),
+                     showgrid=True, gridcolor="#eeeeee", zeroline=False, showline=False, ticks="")
+    fig.update_yaxes(nticks=4, row=2, col=1)
+    tagc = "#e5484d" if chg > 0 else "#3b6fd4"
+    # 현재가 태그(오른쪽 축)
+    fig.add_annotation(xref="paper", x=1.0, xanchor="left", yref="y", y=yv[-1], showarrow=False,
+                       text=f"{last:,.0f}<br>{pct:+.2f}%", align="left", borderpad=2,
+                       font=dict(color="white", size=11), bgcolor=tagc)
+    # 범례(차트 위 한 줄)
+    fig.add_annotation(xref="paper", yref="paper", x=0.0, y=1.0, xanchor="left", yanchor="bottom",
+                       showarrow=False, font=dict(size=11),
+                       text=('<span style="color:#e5484d">▮</span><span style="color:#3b6fd4">▮</span> <span style="color:#111111">수정종가 캔들</span>  '
+                             '<span style="color:#111111">━ 곡선</span>  '
+                             '<span style="color:#1a56db">━ 상한</span>  '
+                             '<span style="color:#e5484d">━ 하한</span>'))
+    # 아래 차트 이름
+    fig.add_annotation(xref="paper", yref="paper", x=0.01, y=fig.layout.yaxis2.domain[1],
+                       xanchor="left", yanchor="top", showarrow=False,
+                       text=low_label, font=dict(size=11, color="#555"))
+    fig.update_layout(height=620, margin=dict(l=4, r=58, t=(78 if idx_arr is not None else 26), b=22),
+                      showlegend=False, bargap=0.05, hovermode=False, dragmode=False,
+                      xaxis_rangeslider_visible=False, xaxis2_rangeslider_visible=False,
+                      plot_bgcolor="white", paper_bgcolor="white")
+    return fig
+
+
+def show(fig, div_id, bars):
+    """좌우 이동 + 길게 눌러 십자선 기능을 얹어 차트를 표시"""
+    def pack(v):
+        return np.round(np.asarray(v, dtype=float), 2).tolist()
+    series = [pack(v) for v in (yv, curvev, upv, lov)]
+    dump = lambda o: json.dumps(o, separators=(",", ":"))
+    idx_json = dump(pack(idx_scaled)) if idx_scaled is not None else "null"
+    raw_json = dump(pack(idx_arr)) if idx_arr is not None else "null"
+    open_json = dump(pack(ov))
+    low_json = dump(pack(lv))
+    idx2_json = dump(pack(idx_scaled_p)) if idx_scaled_p is not None else "null"
+    post = "installCrosshair(document.getElementById('{plot_id}'), %d, %s, %s, %s, %d, %s, %s, %s, %s, %d, %s, %d, %s);" % (
+        init_span, dump(series), dump(pack(bars)),
+        idx_json, (4 if idx_scaled is not None else -1), json.dumps(idx_name),
+        raw_json, open_json, low_json, n - init_span, idx2_json, 5, dump(pack(hv)))
+    html = "<script>" + CROSSHAIR_JS + "</script>" + fig.to_html(
+        full_html=False, include_plotlyjs="cdn", div_id=div_id,
+        config={"staticPlot": True, "responsive": True},
+        post_script=post)
+    components.html(html, height=640)
+
+
+fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.06)
+base_traces(fig)
+cv = curvev - curvev.min()
+fig.add_trace(go.Bar(x=dates, y=cv, marker_color=direction_colors(curvev),
+                     name="곡선추세 방향", showlegend=False), row=2, col=1)
+show(finish(fig, "곡선추세 방향"), "chart_trend", cv)
+status.empty()
+if idx_arr is None:
+    st.caption("※ 지수 데이터를 불러오지 못해 비교선 없이 표시 중입니다.")
+elif idx_note:
+    st.caption(idx_note)
