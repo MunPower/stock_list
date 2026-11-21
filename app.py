@@ -20,7 +20,7 @@ from urllib.parse import urlencode
 
 st.set_page_config(page_title="코스피·코스닥 TOP80 차트", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""<style>
-.block-container{padding:0.8rem 0.4rem 1rem 0.4rem;max-width:100%;}
+.block-container{padding:0.8rem 0.4rem 110px 0.4rem;max-width:100%;}  /* 아래 110px 여백: GitHub 화면(index.html)이 아래 72px를 가려도 마지막 줄까지 보이게 */
 header,[data-testid="stHeader"],[data-testid="stToolbar"],[data-testid="stDecoration"],footer,
 [data-testid="manage-app-button"],[class*="_profileContainer_"],[class*="viewerBadge"],[class*="_terminalButton_"],[class*="_gzau3_"]{display:none !important;}
 </style>""", unsafe_allow_html=True)
