@@ -1,3 +1,7 @@
+import os
+# 행렬 계산이 CPU 코어를 전부 차지하지 않도록 계산 스레드를 1개로 제한 (numpy를 불러오기 전에 설정해야 함)
+for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -5,6 +9,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import FinanceDataReader as fdr
 import json
+import time
 import html
 from concurrent.futures import ThreadPoolExecutor
 import re
@@ -148,22 +153,40 @@ def signal_of(y: np.ndarray):
     return None
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def list_signals(codes: tuple):
-    """리스트 종목들의 매수·매도 신호를 한꺼번에 계산 (여러 종목 시세를 동시에 받음)"""
-    days = max(int(calc), 180)
+def _closes(c: str, days: int):
+    d = fdr.DataReader(c, _start(days)).tail(int(days))
+    return d["Close"].to_numpy(dtype=float)
 
-    def one(c):
+
+@st.cache_data(ttl=600, show_spinner=False)
+def list_closes(codes: tuple, days: int):
+    """리스트 종목들의 종가를 동시에 받아 옴. 전체 40초가 지나면 받은 것까지만 사용(화면이 멈추지 않게)"""
+    from concurrent.futures import wait
+    ex = ThreadPoolExecutor(max_workers=8)
+    futs = {ex.submit(_closes, c, days): c for c in codes}
+    done, _ = wait(futs, timeout=40)
+    ex.shutdown(wait=False, cancel_futures=True)
+    out = {}
+    for f in done:
         try:
-            d = hist(c, days)
-            y = d["Close"].to_numpy(dtype=float)
-            if len(y) < 60 or not np.isfinite(y).all():
-                return c, None
-            return c, signal_of(y)
+            out[futs[f]] = f.result()
         except Exception:
-            return c, None
-    with ThreadPoolExecutor(max_workers=12) as ex:
-        return dict(ex.map(one, codes))
+            pass
+    return out
+
+
+def list_signals(codes: tuple):
+    """리스트 종목들의 매수·매도 신호 {코드: 'buy'/'sell'/None}"""
+    days = max(int(calc), 180)
+    closes = list_closes(codes, days)
+    sig = {}
+    for c in codes:
+        y = closes.get(c)
+        try:
+            sig[c] = signal_of(y) if y is not None and len(y) >= 60 and np.isfinite(y).all() else None
+        except Exception:
+            sig[c] = None
+    return sig
 
 
 # ───────────── ① 리스트 화면 ─────────────
@@ -267,11 +290,16 @@ if not qp.get("code"):
     ph = st.empty()
     ph.markdown(build(None), unsafe_allow_html=True)          # ① 리스트 먼저 표시
     note.caption("⏳ 매수·매도 신호를 계산하는 중입니다… (처음 한 번은 조금 걸려요)")
+    _t0 = time.time()
     try:
         sig = list_signals(tuple(r[0] for r in rows))
-    except Exception:
+    except Exception as e:
         sig = {}
+        st.caption(f"신호 계산 오류: {e}")
     note.empty()
+    _got = len(list_closes(tuple(r[0] for r in rows), max(int(calc), 180))) if sig else 0
+    if _got < len(rows):          # 시세를 다 못 받았으면 알려줌 (빈칸 = 계산 못 한 종목 포함)
+        st.caption(f"※ {len(rows)}종목 중 {_got}종목만 시세를 받아 신호를 계산했습니다 ({time.time() - _t0:.0f}초).")
     ph.markdown(build(sig), unsafe_allow_html=True)           # ② 신호 칸 채워서 다시 표시
     st.stop()
 
