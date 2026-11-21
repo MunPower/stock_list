@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import re
 import streamlit.components.v1 as components
 from pathlib import Path
+from urllib.parse import urlencode
 
 st.set_page_config(page_title="코스피·코스닥 TOP80 차트", layout="wide", initial_sidebar_state="collapsed")
 st.markdown("""<style>
@@ -21,16 +22,6 @@ header,[data-testid="stHeader"],[data-testid="stToolbar"],[data-testid="stDecora
 # ───────────── 차트 계산 설정(고정값) ─────────────
 disp, calc, lam, kmul, band_pct = 120, 720, 8e3, 1.6, 0.0
 
-
-# ───────────── 화면 상태 (list = 종목 리스트, chart = 차트) ─────────────
-ss = st.session_state
-ss.setdefault("view", "list")        # 처음 화면은 리스트
-ss.setdefault("market", "KOSPI")     # 리스트 기본값은 코스피
-ss.setdefault("nonce", 0)            # 목록으로 돌아올 때마다 리스트 화면을 새로 만들기 위한 번호
-ss.setdefault("last_t", None)        # 이미 처리한 클릭인지 구분
-
-# 리스트 화면(클릭하면 파이썬으로 종목을 알려주는 작은 화면) — stock_list/index.html
-_stock_list = components.declare_component("stock_list", path=str(Path(__file__).parent / "stock_list"))
 
 TOP_N = 80   # 시가총액 상위 몇 등까지 보여줄지
 
@@ -100,46 +91,92 @@ def top_lists(n: int = TOP_N):
     return {"KOSPI": [], "KOSDAQ": []}, asof
 
 
-def history_js(view: str):
-    """폰의 '뒤로' 동작(제스처/버튼)으로도 차트 → 리스트로 돌아가게 함"""
-    components.html("""<script>
-(function(){
-  try{
-    var w=window.parent, view=%s;
-    if(!w.__chartBackInit){
-      w.__chartBackInit=true;
-      w.addEventListener('popstate',function(){
-        if(!w.__inChart)return;
-        w.__inChart=false;
-        var bs=w.document.querySelectorAll('button');
-        for(var i=0;i<bs.length;i++){ if((bs[i].innerText||'').indexOf('목록으로')>=0){ bs[i].click(); break; } }
-      });
-    }
-    if(view==='chart' && !w.__inChart){ w.__inChart=true; w.history.pushState({chart:1},''); }
-    if(view==='list' && w.__inChart){ w.__inChart=false; w.history.back(); }   // 화면의 ← 버튼으로 돌아온 경우
-  }catch(e){}
-})();
-</script>""" % json.dumps(view), height=0)
-
-
 # ───────────── ① 리스트 화면 ─────────────
-if ss.view == "list":
-    history_js("list")
+# 주소에 종목이 있으면(?code=...) 차트 화면, 없으면 리스트 화면
+qp = st.query_params
+KEEP = {k: qp.get(k) for k in ("embed", "embed_options") if qp.get(k)}   # 감싼 화면(index.html)용 주소 옵션 유지
+
+
+def link(**kw) -> str:
+    return "?" + urlencode({**KEEP, **kw})
+
+
+def n0(v):
+    return "-" if v is None else f"{v:,.0f}"
+
+
+def ud(v, base):     # 전일 종가보다 높으면 빨강(up), 낮으면 파랑(dn)
+    if v is None or base is None:
+        return "eq"
+    return "up" if v > base else ("dn" if v < base else "eq")
+
+
+LIST_CSS = """<style>
+.sl-top{display:flex;align-items:center;gap:8px;margin:4px 0 8px 0}
+.sl-top a.tab{display:inline-block;min-width:92px;text-align:center;padding:8px 14px;font-size:16px;font-weight:700;
+ border:1px solid #c9ced6;background:#f4f5f7;color:#555 !important;border-radius:8px;text-decoration:none !important}
+.sl-top a.tab.on{background:#1f4fa8;border-color:#1f4fa8;color:#fff !important}
+.sl-top .asof{margin-left:auto;font-size:12px;color:#888;white-space:nowrap}
+.sl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid #c9ced6}
+.sl-wrap table{border-collapse:collapse;width:100%;min-width:760px;font-size:13px;margin:0}
+.sl-wrap th{background:#e9edf3;color:#333;font-weight:600;padding:6px;border:1px solid #d3d8df;white-space:nowrap;text-align:center}
+.sl-wrap td{padding:0;border:1px solid #e3e6ea;white-space:nowrap;text-align:right;font-variant-numeric:tabular-nums}
+.sl-wrap td a{display:block;padding:6px;color:inherit !important;text-decoration:none !important}
+.sl-wrap td.rk{text-align:center;color:#888;width:34px}
+.sl-wrap td.cd{text-align:left;color:#333}
+.sl-wrap td.nm{text-align:left;font-weight:600;color:#111;max-width:190px;overflow:hidden;text-overflow:ellipsis}
+.sl-wrap td.nm .sub{display:none;font-size:11px;font-weight:400;color:#999}
+.sl-wrap tr:nth-child(even) td{background:#fafbfc}
+.sl-wrap tbody tr:hover td{background:#eef4ff}
+.sl-wrap .up{color:#e5484d}.sl-wrap .dn{color:#1a56db}.sl-wrap .eq{color:#333}
+@media (max-width:600px){
+ .sl-top a.tab{min-width:80px;padding:7px 10px;font-size:15px}
+ .sl-wrap table{min-width:620px}
+ .sl-wrap th.cd,.sl-wrap td.cd{display:none}
+ .sl-wrap td.nm .sub{display:block}
+ .sl-wrap td.nm{max-width:118px}
+ .sl-wrap th.rk,.sl-wrap td.rk{position:sticky;left:0;z-index:2;background:#fff}
+ .sl-wrap th.nm,.sl-wrap td.nm{position:sticky;left:34px;z-index:2;background:#fff;box-shadow:1px 0 0 #d3d8df}
+ .sl-wrap th.rk,.sl-wrap th.nm{background:#e9edf3}
+ .sl-wrap tr:nth-child(even) td.rk,.sl-wrap tr:nth-child(even) td.nm{background:#fafbfc}
+}
+</style>"""
+
+
+if not qp.get("code"):
+    market = "KOSDAQ" if qp.get("m") == "KOSDAQ" else "KOSPI"     # 기본값은 코스피
     with st.spinner("코스피·코스닥 시가총액 순위를 불러오는 중입니다…"):
         lists, asof = top_lists()
-    if not lists["KOSPI"] and not lists["KOSDAQ"]:
+    rows = lists.get(market, [])
+    if not rows:
         st.error("종목 리스트를 불러오지 못했습니다. 잠시 후 새로고침해 주세요.")
         st.stop()
-    val = _stock_list(kospi=lists["KOSPI"], kosdaq=lists["KOSDAQ"], market=ss.market, asof=asof,
-                      key=f"stock_list_{ss.nonce}", default=None)
-    if isinstance(val, dict) and val.get("t") and val.get("t") != ss.last_t:   # 종목을 눌렀음 → 차트로
-        ss.last_t = val["t"]
-        ss.code = str(val.get("code"))
-        ss.name = str(val.get("name") or ss.code)
-        ss.mkt = "KOSDAQ" if val.get("mkt") == "KOSDAQ" else "KOSPI"
-        ss.market = ss.mkt                       # 돌아왔을 때 같은 탭(코스피/코스닥)을 보여줌
-        ss.view = "chart"
-        st.rerun()
+    h = [LIST_CSS, '<div class="sl-top">']
+    for m, label in (("KOSPI", "코스피"), ("KOSDAQ", "코스닥")):
+        h.append(f'<a class="tab{" on" if m == market else ""}" href="{link(m=m)}" target="_self">{label}</a>')
+    h.append(f'<span class="asof">기준 {asof}</span></div>')
+    h.append('<div class="sl-wrap"><table><thead><tr><th class="rk">순위</th><th class="cd">종목코드</th>'
+             '<th class="nm">종목명</th><th>현재가</th><th>대비</th><th>등락률</th><th>시가</th><th>고가</th><th>저가</th>'
+             '</tr></thead><tbody>')
+    for i, (c, nm, close, chg, pct, op, hi, lo) in enumerate(rows, 1):
+        href = html.escape(link(code=c, name=nm, mkt=market))
+        a = f'<a href="{href}" target="_self">'
+        prev = close - chg if (close is not None and chg is not None) else None
+        k = "eq" if pct is None else ("up" if pct > 0 else ("dn" if pct < 0 else "eq"))
+        arrow = "" if not pct else ("▲ " if pct > 0 else "▼ ")
+        pct_t = "-" if pct is None else f"{pct:+.2f}%" if pct else "0.00%"
+        nm_e, c_e = html.escape(nm), html.escape(c)
+        h.append(
+            f'<tr><td class="rk">{a}{i}</a></td><td class="cd">{a}{c_e}</a></td>'
+            f'<td class="nm">{a}{nm_e}<span class="sub">{c_e}</span></a></td>'
+            f'<td class="{k}">{a}{n0(close)}</a></td>'
+            f'<td class="{k}">{a}{arrow}{n0(None if chg is None else abs(chg))}</a></td>'
+            f'<td class="{k}">{a}{pct_t}</a></td>'
+            f'<td class="{ud(op, prev)}">{a}{n0(op)}</a></td>'
+            f'<td class="{ud(hi, prev)}">{a}{n0(hi)}</a></td>'
+            f'<td class="{ud(lo, prev)}">{a}{n0(lo)}</a></td></tr>')
+    h.append('</tbody></table></div>')
+    st.markdown("".join(h), unsafe_allow_html=True)    # 줄바꿈 없이 한 덩어리로 넣어야 표가 깨지지 않음
     st.stop()
 
 
@@ -148,12 +185,16 @@ st.markdown("""<style>
 div.stButton > button{padding:2px 14px;min-height:0;font-size:15px;font-weight:600;border-radius:6px;}
 </style>""", unsafe_allow_html=True)
 if st.button("← 목록으로", key="back_btn"):
-    ss.view = "list"
-    ss.nonce += 1
+    _m = "KOSDAQ" if qp.get("mkt") == "KOSDAQ" else "KOSPI"
+    for k in ("code", "name", "mkt"):
+        if k in st.query_params:
+            del st.query_params[k]
+    st.query_params["m"] = _m                # 돌아가면 보던 탭(코스피/코스닥)이 나오게
     st.rerun()
-history_js("chart")
 
-code, name, mkt = ss.code, ss.name, ss.mkt
+code = str(qp.get("code")).strip()
+name = str(qp.get("name") or code)
+mkt = "KOSDAQ" if qp.get("mkt") == "KOSDAQ" else "KOSPI"
 name_ph = st.empty()
 name_ph.markdown(
     f'<div style="font-size:20px;font-weight:700;line-height:1.3">{html.escape(str(name))} '
