@@ -191,10 +191,26 @@ def prefetch(codes: tuple, days: int, timeout: float = 40):
     return {c: cached_hist(c, days) for c in codes}
 
 
+def fmt_sec(x: float) -> str:
+    return f"{x:.1f}초" if x < 10 else f"{x:.0f}초"
+
+
+def timing_html(parts) -> str:
+    """[('리스트', 0.3), ('시세', 5.2), ...] → 작은 회색 글씨 한 줄. 느린 칸(3초 이상)은 주황색"""
+    out = []
+    for k, v in parts:
+        col = "#d9480f" if v >= 3 else "#888"
+        out.append(f'{k} <b style="color:{col}">{fmt_sec(v)}</b>')
+    return '<span class="tm">⏱ ' + " · ".join(out) + "</span>"
+
+
 def list_signals(codes: tuple):
     """리스트 종목들의 매수·매도 신호 {코드: 'buy'/'sell'/None}, 시세를 받은 종목 수"""
     days = max(int(calc), 180)
+    _t = time.time()
     data = prefetch(codes, days)
+    t_fetch = time.time() - _t
+    _t = time.time()
     sig, got = {}, 0
     for c in codes:
         d = data.get(c)
@@ -208,7 +224,7 @@ def list_signals(codes: tuple):
                 sig[c] = signal_of(y)
         except Exception:
             pass
-    return sig, got
+    return sig, got, t_fetch, time.time() - _t
 
 
 # ───────────── ① 리스트 화면 ─────────────
@@ -237,6 +253,8 @@ LIST_CSS = """<style>
  border:1px solid #c9ced6;background:#f4f5f7;color:#555 !important;border-radius:8px;text-decoration:none !important}
 .sl-top a.tab.on{background:#1f4fa8;border-color:#1f4fa8;color:#fff !important}
 .sl-top .asof{margin-left:auto;font-size:12px;color:#888;white-space:nowrap}
+.tm{font-size:12px;color:#888;white-space:nowrap}.tm b{font-weight:600}
+@media (max-width:600px){.sl-top{flex-wrap:wrap}.sl-top .tm{order:3;width:100%}}
 .sl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid #c9ced6}
 .sl-wrap table{border-collapse:collapse;width:100%;min-width:760px;font-size:13px;margin:0}
 .sl-wrap th{background:#e9edf3;color:#333;font-weight:600;padding:6px;border:1px solid #d3d8df;white-space:nowrap;text-align:center}
@@ -267,15 +285,18 @@ LIST_CSS = """<style>
 if not qp.get("code"):
     market = "KOSDAQ" if qp.get("m") == "KOSDAQ" else "KOSPI"     # 기본값은 코스피
     with st.spinner("코스피·코스닥 시가총액 순위를 불러오는 중입니다…"):
+        _tl = time.time()
         lists, asof = top_lists()
+        t_list = time.time() - _tl
     rows = lists.get(market, [])
     if not rows:
         st.error("종목 리스트를 불러오지 못했습니다. 잠시 후 새로고침해 주세요.")
         st.stop()
-    def build(sig):
+    def build(sig, tm=""):
         h = [LIST_CSS, '<div class="sl-top">']
         for m, label in (("KOSPI", "코스피"), ("KOSDAQ", "코스닥")):
             h.append(f'<a class="tab{" on" if m == market else ""}" href="{link(m=m)}" target="_self">{label}</a>')
+        h.append(tm or '<span class="tm">⏱ 측정 중…</span>')
         h.append(f'<span class="asof">기준 {asof}</span></div>')
         h.append('<div class="sl-wrap"><table><thead><tr><th class="rk">순위</th><th class="cd">종목코드</th>'
                  '<th class="nm">종목명</th><th>신호</th><th>현재가</th><th>대비</th><th>등락률</th>'
@@ -318,14 +339,15 @@ if not qp.get("code"):
         note.caption("⏳ 매수·매도 신호를 계산하는 중입니다… (처음 한 번은 조금 걸려요)")
     _t0 = time.time()
     try:
-        sig, _got = list_signals(codes)
+        sig, _got, t_fetch, t_calc = list_signals(codes)
     except Exception as e:
-        sig, _got = {}, len(codes)
+        sig, _got, t_fetch, t_calc = {}, len(codes), time.time() - _t0, 0.0
         st.caption(f"신호 계산 오류: {e}")
     note.empty()
     if _got < len(rows):          # 시세를 다 못 받았으면 알려줌 (빈칸 = 계산 못 한 종목 포함)
         st.caption(f"※ {len(rows)}종목 중 {_got}종목만 시세를 받아 신호를 계산했습니다 ({time.time() - _t0:.0f}초).")
-    ph.markdown(build(sig), unsafe_allow_html=True)           # ② 신호 칸 채워서 표시
+    _tm = timing_html([("리스트", t_list), ("시세", t_fetch), ("계산", t_calc)])
+    ph.markdown(build(sig, _tm), unsafe_allow_html=True)      # ② 신호 칸 + 걸린 시간 채워서 표시
     st.markdown("<style>div.stButton > button{padding:2px 12px;min-height:0;font-size:13px;}</style>",
                 unsafe_allow_html=True)
     if st.button("↻ 새로고침 (시세 다시 받기)", key="refresh_btn"):
@@ -338,16 +360,22 @@ if not qp.get("code"):
 
 
 # ───────────── ② 차트 화면 (주식001 차트) ─────────────
-st.markdown("""<style>
-div.stButton > button{padding:2px 14px;min-height:0;font-size:15px;font-weight:600;border-radius:6px;}
-</style>""", unsafe_allow_html=True)
-if st.button("← 목록으로", key="back_btn"):
-    _m = "KOSDAQ" if qp.get("mkt") == "KOSDAQ" else "KOSPI"
-    for k in ("code", "name", "mkt"):
-        if k in st.query_params:
-            del st.query_params[k]
-    st.query_params["m"] = _m                # 돌아가면 보던 탭(코스피/코스닥)이 나오게
-    st.rerun()
+_t_chart0 = time.time()
+_back_m = "KOSDAQ" if qp.get("mkt") == "KOSDAQ" else "KOSPI"
+BACK_CSS = ('<style>.cv-top{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:2px 0 4px 0}'
+            '.cv-top a.back{display:inline-block;padding:4px 14px;font-size:15px;font-weight:600;border:1px solid #c9ced6;'
+            'border-radius:6px;background:#f4f5f7;color:#333 !important;text-decoration:none !important}'
+            '.tm{font-size:12px;color:#888;white-space:nowrap}.tm b{font-weight:600}</style>')
+
+
+def top_bar(tm: str) -> str:
+    """← 목록으로 버튼 + 걸린 시간 (돌아가면 보던 탭이 나오게 m=코스피/코스닥)"""
+    return (BACK_CSS + '<div class="cv-top">'
+            f'<a class="back" href="{html.escape(link(m=_back_m))}" target="_self">← 목록으로</a>{tm}</div>')
+
+
+top_ph = st.empty()
+top_ph.markdown(top_bar('<span class="tm">⏱ 측정 중…</span>'), unsafe_allow_html=True)
 
 code = str(qp.get("code")).strip()
 name = str(qp.get("name") or code)
@@ -400,7 +428,9 @@ def load_both(code: str, idx_sym: str, days: int):
 calc = max(int(calc), 180)
 idx_sym, idx_name = ("KQ11", "코스닥") if mkt == "KOSDAQ" else ("KS11", "코스피")
 try:
+    _tf = time.time()
     df, _idf = load_both(code.strip(), idx_sym, calc)
+    t_fetch = time.time() - _tf
 except Exception as e:
     status.empty()
     st.error(f"데이터를 불러오지 못했습니다: {e}")
@@ -410,6 +440,7 @@ if df.empty or len(df) < 60:
     st.warning("데이터가 부족합니다(60개 이상 필요). 종목코드를 확인하세요.")
     st.stop()
 
+_tc = time.time()
 y = df["Close"].to_numpy(dtype=float)
 n = len(y)
 t = np.arange(n)
@@ -874,6 +905,8 @@ def show(fig, div_id, bars):
     components.html(html, height=640)
 
 
+t_calc = time.time() - _tc
+_td = time.time()
 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.72, 0.28], vertical_spacing=0.06)
 base_traces(fig)
 cv = curvev - curvev.min()
@@ -881,6 +914,8 @@ fig.add_trace(go.Bar(x=dates, y=cv, marker_color=direction_colors(curvev),
                      name="곡선추세 방향", showlegend=False), row=2, col=1)
 show(finish(fig, "곡선추세 방향"), "chart_trend", cv)
 status.empty()
+top_ph.markdown(top_bar(timing_html([("시세", t_fetch), ("계산", t_calc), ("차트", time.time() - _td)])),
+                unsafe_allow_html=True)
 if idx_arr is None:
     st.caption("※ 지수 데이터를 불러오지 못해 비교선 없이 표시 중입니다.")
 elif idx_note:
