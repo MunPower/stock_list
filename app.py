@@ -10,6 +10,7 @@ from plotly.subplots import make_subplots
 import FinanceDataReader as fdr
 import json
 import time
+import threading
 import html
 from concurrent.futures import ThreadPoolExecutor
 import re
@@ -84,9 +85,9 @@ def _from_naver(n):
     return out
 
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def top_lists(n: int = TOP_N):
-    """코스피·코스닥 시가총액 1~n위. 2분 동안은 저장해 둔 목록을 그대로 사용"""
+    """코스피·코스닥 시가총액 1~n위. 10분 동안은 저장해 둔 목록을 그대로 사용 (새로고침 버튼으로 바로 다시 받기)"""
     asof = pd.Timestamp.now(tz="Asia/Seoul").strftime("%m-%d %H:%M")
     for f in (_from_fdr, _from_naver):            # 먼저 FinanceDataReader, 안 되면 네이버에서 받기
         try:
@@ -104,10 +105,35 @@ def _start(days: int) -> str:
     return (pd.Timestamp.today() - pd.Timedelta(days=int(days * 1.6) + 10)).strftime("%Y-%m-%d")
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+STORE_TTL = 600     # 받은 시세를 10분 동안 재사용
+
+
+@st.cache_resource(show_spinner=False)
+def _store():
+    """리스트에서 받은 종목 시세를 차트도 그대로 쓰도록 서버에 보관하는 저장소"""
+    return {"lock": threading.Lock(), "data": {}}
+
+
+def cached_hist(code: str, days: int):
+    """저장소에 10분 이내에 받은 시세가 있으면 그것을, 없으면 None"""
+    ent = _store()["data"].get((code, int(days)))
+    if ent and time.time() - ent[0] < STORE_TTL:
+        return ent[1]
+    return None
+
+
+def _fetch(code: str, days: int):
+    d = fdr.DataReader(code, _start(days)).tail(int(days))
+    st_ = _store()
+    with st_["lock"]:
+        st_["data"][(code, int(days))] = (time.time(), d)
+    return d
+
+
 def hist(code: str, days: int):
     """종목 일봉 (10분 동안 저장해 두고 리스트·차트가 같이 사용)"""
-    return fdr.DataReader(code, _start(days)).tail(int(days))
+    d = cached_hist(code, days)
+    return d if d is not None else _fetch(code, days)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -153,40 +179,36 @@ def signal_of(y: np.ndarray):
     return None
 
 
-def _closes(c: str, days: int):
-    d = fdr.DataReader(c, _start(days)).tail(int(days))
-    return d["Close"].to_numpy(dtype=float)
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def list_closes(codes: tuple, days: int):
-    """리스트 종목들의 종가를 동시에 받아 옴. 전체 40초가 지나면 받은 것까지만 사용(화면이 멈추지 않게)"""
+def prefetch(codes: tuple, days: int, timeout: float = 40):
+    """저장소에 없는(또는 10분 지난) 종목만 동시에 받아 저장. 전체 40초가 지나면 받은 것까지만 사용"""
     from concurrent.futures import wait
-    ex = ThreadPoolExecutor(max_workers=8)
-    futs = {ex.submit(_closes, c, days): c for c in codes}
-    done, _ = wait(futs, timeout=40)
-    ex.shutdown(wait=False, cancel_futures=True)
-    out = {}
-    for f in done:
-        try:
-            out[futs[f]] = f.result()
-        except Exception:
-            pass
-    return out
+    missing = [c for c in codes if cached_hist(c, days) is None]
+    if missing:
+        ex = ThreadPoolExecutor(max_workers=8)
+        futs = [ex.submit(_fetch, c, days) for c in missing]
+        wait(futs, timeout=timeout)
+        ex.shutdown(wait=False, cancel_futures=True)
+    return {c: cached_hist(c, days) for c in codes}
 
 
 def list_signals(codes: tuple):
-    """리스트 종목들의 매수·매도 신호 {코드: 'buy'/'sell'/None}"""
+    """리스트 종목들의 매수·매도 신호 {코드: 'buy'/'sell'/None}, 시세를 받은 종목 수"""
     days = max(int(calc), 180)
-    closes = list_closes(codes, days)
-    sig = {}
+    data = prefetch(codes, days)
+    sig, got = {}, 0
     for c in codes:
-        y = closes.get(c)
+        d = data.get(c)
+        sig[c] = None
+        if d is None:
+            continue
+        got += 1
         try:
-            sig[c] = signal_of(y) if y is not None and len(y) >= 60 and np.isfinite(y).all() else None
+            y = d["Close"].to_numpy(dtype=float)
+            if len(y) >= 60 and np.isfinite(y).all():
+                sig[c] = signal_of(y)
         except Exception:
-            sig[c] = None
-    return sig
+            pass
+    return sig, got
 
 
 # ───────────── ① 리스트 화면 ─────────────
@@ -286,21 +308,32 @@ if not qp.get("code"):
         h.append('</tbody></table></div>')
         return "".join(h)                             # 줄바꿈 없이 한 덩어리로 넣어야 표가 깨지지 않음
 
+    codes = tuple(r[0] for r in rows)
+    days = max(int(calc), 180)
     note = st.empty()
     ph = st.empty()
-    ph.markdown(build(None), unsafe_allow_html=True)          # ① 리스트 먼저 표시
-    note.caption("⏳ 매수·매도 신호를 계산하는 중입니다… (처음 한 번은 조금 걸려요)")
+    ready = all(cached_hist(c, days) is not None for c in codes)    # 10분 안에 받은 시세가 다 있음
+    if not ready:
+        ph.markdown(build(None), unsafe_allow_html=True)      # ① 리스트 먼저 표시
+        note.caption("⏳ 매수·매도 신호를 계산하는 중입니다… (처음 한 번은 조금 걸려요)")
     _t0 = time.time()
     try:
-        sig = list_signals(tuple(r[0] for r in rows))
+        sig, _got = list_signals(codes)
     except Exception as e:
-        sig = {}
+        sig, _got = {}, len(codes)
         st.caption(f"신호 계산 오류: {e}")
     note.empty()
-    _got = len(list_closes(tuple(r[0] for r in rows), max(int(calc), 180))) if sig else 0
     if _got < len(rows):          # 시세를 다 못 받았으면 알려줌 (빈칸 = 계산 못 한 종목 포함)
         st.caption(f"※ {len(rows)}종목 중 {_got}종목만 시세를 받아 신호를 계산했습니다 ({time.time() - _t0:.0f}초).")
-    ph.markdown(build(sig), unsafe_allow_html=True)           # ② 신호 칸 채워서 다시 표시
+    ph.markdown(build(sig), unsafe_allow_html=True)           # ② 신호 칸 채워서 표시
+    st.markdown("<style>div.stButton > button{padding:2px 12px;min-height:0;font-size:13px;}</style>",
+                unsafe_allow_html=True)
+    if st.button("↻ 새로고침 (시세 다시 받기)", key="refresh_btn"):
+        top_lists.clear()
+        idx_hist.clear()
+        with _store()["lock"]:
+            _store()["data"].clear()
+        st.rerun()
     st.stop()
 
 
@@ -327,10 +360,11 @@ name_ph.markdown(
 
 # 시세를 받는 동안 "고장난 것처럼" 보이지 않도록 안내 표시 (차트가 나오면 사라짐)
 status = st.empty()
-status.markdown(
-    '<div style="padding:10px 12px;border-radius:8px;background:#fff4dc;color:#8a5a00;font-size:14px;line-height:1.5">'
-    '⏳ 시세를 불러오는 중입니다. 처음 한 번은 20~30초 걸릴 수 있어요. 잠시만 기다려 주세요.</div>',
-    unsafe_allow_html=True)
+if cached_hist(code, max(int(calc), 180)) is None:
+    status.markdown(
+        '<div style="padding:10px 12px;border-radius:8px;background:#fff4dc;color:#8a5a00;font-size:14px;line-height:1.5">'
+        '⏳ 시세를 불러오는 중입니다. 처음 한 번은 20~30초 걸릴 수 있어요. 잠시만 기다려 주세요.</div>',
+        unsafe_allow_html=True)
 
 @st.cache_data(ttl=30, show_spinner=False)
 def live_index(sym: str):
