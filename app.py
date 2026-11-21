@@ -91,6 +91,81 @@ def top_lists(n: int = TOP_N):
     return {"KOSPI": [], "KOSDAQ": []}, asof
 
 
+# ───────────── 공통: 시세 받기 + 매도선·매수선 계산 (리스트 신호와 차트가 똑같이 사용) ─────────────
+from functools import lru_cache
+
+
+def _start(days: int) -> str:
+    return (pd.Timestamp.today() - pd.Timedelta(days=int(days * 1.6) + 10)).strftime("%Y-%m-%d")
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def hist(code: str, days: int):
+    """종목 일봉 (10분 동안 저장해 두고 리스트·차트가 같이 사용)"""
+    return fdr.DataReader(code, _start(days)).tail(int(days))
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def idx_hist(sym: str, days: int):
+    return fdr.DataReader(sym, _start(days)).tail(int(days))
+
+
+@lru_cache(maxsize=8)
+def _hp_inv(n: int, lam: float) -> np.ndarray:
+    """HP필터 계산용 행렬의 역행렬. 기간(n)이 같으면 모든 종목이 같은 행렬이라 한 번만 만들어 재사용"""
+    D = np.zeros((n - 2, n))
+    for i in range(n - 2):
+        D[i, i:i + 3] = [1, -2, 1]
+    return np.linalg.inv(np.eye(n) + lam * D.T @ D)
+
+
+def hp_trend(z: np.ndarray, lam: float) -> np.ndarray:
+    """Hodrick-Prescott 필터의 추세 성분: (I + λ D'D) τ = z"""
+    return _hp_inv(len(z), float(lam)) @ z
+
+
+def calc_bands(y: np.ndarray):
+    """곡선추세, 매도선(상한), 매수선(하한)"""
+    t = np.arange(len(y))
+    b1, b0 = np.polyfit(t, y, 1)              # 직선추세: 계산기간 전체 1차 회귀
+    line = b0 + b1 * t
+    curve = line + hp_trend(y - line, lam)    # 곡선추세: 직선추세 제거 → HP필터 → 복원
+    width = band_pct / 100 if band_pct > 0 else kmul * (y / curve - 1).std()
+    return curve, curve * (1 + width), curve * (1 - width)
+
+
+TOUCH_TOL = 0          # 0 = 매도선·매수선에 정확히 닿거나 넘었을 때만 신호
+
+
+def signal_of(y: np.ndarray):
+    """'sell'(매도 가능) / 'buy'(매수 가능) / None"""
+    _, up, lo = calc_bands(y)
+    last = y[-1]
+    if last >= up[-1] * (1 - TOUCH_TOL):
+        return "sell"
+    if last <= lo[-1] * (1 + TOUCH_TOL):
+        return "buy"
+    return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def list_signals(codes: tuple):
+    """리스트 종목들의 매수·매도 신호를 한꺼번에 계산 (여러 종목 시세를 동시에 받음)"""
+    days = max(int(calc), 180)
+
+    def one(c):
+        try:
+            d = hist(c, days)
+            y = d["Close"].to_numpy(dtype=float)
+            if len(y) < 60 or not np.isfinite(y).all():
+                return c, None
+            return c, signal_of(y)
+        except Exception:
+            return c, None
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        return dict(ex.map(one, codes))
+
+
 # ───────────── ① 리스트 화면 ─────────────
 # 주소에 종목이 있으면(?code=...) 차트 화면, 없으면 리스트 화면
 qp = st.query_params
@@ -128,6 +203,7 @@ LIST_CSS = """<style>
 .sl-wrap td.nm .sub{display:none;font-size:11px;font-weight:400;color:#999}
 .sl-wrap tr:nth-child(even) td{background:#fafbfc}
 .sl-wrap tbody tr:hover td{background:#eef4ff}
+.sl-wrap td.sg{text-align:center;font-weight:800;min-width:76px}.sl-wrap td.sg.buy{color:#e5484d}.sl-wrap td.sg.sell{color:#1a56db}.sl-wrap td.sg.wait{color:#bbb;font-weight:400}
 .sl-wrap .up{color:#e5484d}.sl-wrap .dn{color:#1a56db}.sl-wrap .eq{color:#333}
 @media (max-width:600px){
  .sl-top a.tab{min-width:80px;padding:7px 10px;font-size:15px}
@@ -151,32 +227,52 @@ if not qp.get("code"):
     if not rows:
         st.error("종목 리스트를 불러오지 못했습니다. 잠시 후 새로고침해 주세요.")
         st.stop()
-    h = [LIST_CSS, '<div class="sl-top">']
-    for m, label in (("KOSPI", "코스피"), ("KOSDAQ", "코스닥")):
-        h.append(f'<a class="tab{" on" if m == market else ""}" href="{link(m=m)}" target="_self">{label}</a>')
-    h.append(f'<span class="asof">기준 {asof}</span></div>')
-    h.append('<div class="sl-wrap"><table><thead><tr><th class="rk">순위</th><th class="cd">종목코드</th>'
-             '<th class="nm">종목명</th><th>현재가</th><th>대비</th><th>등락률</th><th>시가</th><th>고가</th><th>저가</th>'
-             '</tr></thead><tbody>')
-    for i, (c, nm, close, chg, pct, op, hi, lo) in enumerate(rows, 1):
-        href = html.escape(link(code=c, name=nm, mkt=market))
-        a = f'<a href="{href}" target="_self">'
-        prev = close - chg if (close is not None and chg is not None) else None
-        k = "eq" if pct is None else ("up" if pct > 0 else ("dn" if pct < 0 else "eq"))
-        arrow = "" if not pct else ("▲ " if pct > 0 else "▼ ")
-        pct_t = "-" if pct is None else f"{pct:+.2f}%" if pct else "0.00%"
-        nm_e, c_e = html.escape(nm), html.escape(c)
-        h.append(
-            f'<tr><td class="rk">{a}{i}</a></td><td class="cd">{a}{c_e}</a></td>'
-            f'<td class="nm">{a}{nm_e}<span class="sub">{c_e}</span></a></td>'
-            f'<td class="{k}">{a}{n0(close)}</a></td>'
-            f'<td class="{k}">{a}{arrow}{n0(None if chg is None else abs(chg))}</a></td>'
-            f'<td class="{k}">{a}{pct_t}</a></td>'
-            f'<td class="{ud(op, prev)}">{a}{n0(op)}</a></td>'
-            f'<td class="{ud(hi, prev)}">{a}{n0(hi)}</a></td>'
-            f'<td class="{ud(lo, prev)}">{a}{n0(lo)}</a></td></tr>')
-    h.append('</tbody></table></div>')
-    st.markdown("".join(h), unsafe_allow_html=True)    # 줄바꿈 없이 한 덩어리로 넣어야 표가 깨지지 않음
+    def build(sig):
+        h = [LIST_CSS, '<div class="sl-top">']
+        for m, label in (("KOSPI", "코스피"), ("KOSDAQ", "코스닥")):
+            h.append(f'<a class="tab{" on" if m == market else ""}" href="{link(m=m)}" target="_self">{label}</a>')
+        h.append(f'<span class="asof">기준 {asof}</span></div>')
+        h.append('<div class="sl-wrap"><table><thead><tr><th class="rk">순위</th><th class="cd">종목코드</th>'
+                 '<th class="nm">종목명</th><th>신호</th><th>현재가</th><th>대비</th><th>등락률</th>'
+                 '<th>시가</th><th>고가</th><th>저가</th></tr></thead><tbody>')
+        for i, (c, nm, close, chg, pct, op, hi, lo) in enumerate(rows, 1):
+            href = html.escape(link(code=c, name=nm, mkt=market))
+            a = f'<a href="{href}" target="_self">'
+            prev = close - chg if (close is not None and chg is not None) else None
+            k = "eq" if pct is None else ("up" if pct > 0 else ("dn" if pct < 0 else "eq"))
+            arrow = "" if not pct else ("▲ " if pct > 0 else "▼ ")
+            pct_t = "-" if pct is None else f"{pct:+.2f}%" if pct else "0.00%"
+            nm_e, c_e = html.escape(nm), html.escape(c)
+            if sig is None:                                   # 아직 계산 중
+                sg = '<td class="sg wait">' + a + '…</a></td>'
+            else:
+                v = sig.get(c)
+                sg = ('<td class="sg buy">' + a + '매수 가능</a></td>' if v == "buy" else
+                      '<td class="sg sell">' + a + '매도 가능</a></td>' if v == "sell" else
+                      '<td class="sg">' + a + '&nbsp;</a></td>')
+            h.append(
+                f'<tr><td class="rk">{a}{i}</a></td><td class="cd">{a}{c_e}</a></td>'
+                f'<td class="nm">{a}{nm_e}<span class="sub">{c_e}</span></a></td>'
+                f'{sg}'
+                f'<td class="{k}">{a}{n0(close)}</a></td>'
+                f'<td class="{k}">{a}{arrow}{n0(None if chg is None else abs(chg))}</a></td>'
+                f'<td class="{k}">{a}{pct_t}</a></td>'
+                f'<td class="{ud(op, prev)}">{a}{n0(op)}</a></td>'
+                f'<td class="{ud(hi, prev)}">{a}{n0(hi)}</a></td>'
+                f'<td class="{ud(lo, prev)}">{a}{n0(lo)}</a></td></tr>')
+        h.append('</tbody></table></div>')
+        return "".join(h)                             # 줄바꿈 없이 한 덩어리로 넣어야 표가 깨지지 않음
+
+    note = st.empty()
+    ph = st.empty()
+    ph.markdown(build(None), unsafe_allow_html=True)          # ① 리스트 먼저 표시
+    note.caption("⏳ 매수·매도 신호를 계산하는 중입니다… (처음 한 번은 조금 걸려요)")
+    try:
+        sig = list_signals(tuple(r[0] for r in rows))
+    except Exception:
+        sig = {}
+    note.empty()
+    ph.markdown(build(sig), unsafe_allow_html=True)           # ② 신호 칸 채워서 다시 표시
     st.stop()
 
 
@@ -223,31 +319,20 @@ def live_index(sym: str):
         return None
 
 
-@st.cache_data(ttl=600, show_spinner=False)
 def load_both(code: str, idx_sym: str, days: int):
     """종목과 지수 시세를 동시에 받아 온다. 지수는 8초 안에 못 받으면 None(차트는 지수선 없이 표시)"""
-    start = (pd.Timestamp.today() - pd.Timedelta(days=int(days * 1.6) + 10)).strftime("%Y-%m-%d")
     ex = ThreadPoolExecutor(max_workers=2)
-    f_stock = ex.submit(fdr.DataReader, code, start)
-    f_idx = ex.submit(fdr.DataReader, idx_sym, start)
+    f_stock = ex.submit(hist, code, int(days))
+    f_idx = ex.submit(idx_hist, idx_sym, int(days))
     try:
-        stock = f_stock.result(timeout=40).tail(int(days))
+        stock = f_stock.result(timeout=40)
         try:
-            idx = f_idx.result(timeout=8).tail(int(days))
+            idx = f_idx.result(timeout=8)
         except Exception:
             idx = None
         return stock, idx
     finally:
         ex.shutdown(wait=False)
-
-
-def hp_trend(z: np.ndarray, lam: float) -> np.ndarray:
-    """Hodrick-Prescott 필터의 추세 성분: (I + λ D'D) τ = z"""
-    n = len(z)
-    D = np.zeros((n - 2, n))
-    for i in range(n - 2):
-        D[i, i:i + 3] = [1, -2, 1]
-    return np.linalg.solve(np.eye(n) + lam * D.T @ D, z)
 
 
 calc = max(int(calc), 180)
@@ -267,16 +352,8 @@ y = df["Close"].to_numpy(dtype=float)
 n = len(y)
 t = np.arange(n)
 
-# 직선추세: 계산기간 전체에 대한 1차 선형회귀
-b1, b0 = np.polyfit(t, y, 1)
-line = b0 + b1 * t
-# 곡선추세: 직선추세 제거 → HP필터 평활화 → 직선추세 복원
-curve = line + hp_trend(y - line, lam)
-# 상·하한: 곡선 대비 비율 변동성 기준 (곡선 × (1 ± kσ))
-rel = y / curve - 1
-sd_rel = rel.std()
-width = band_pct / 100 if band_pct > 0 else kmul * sd_rel
-upper, lower = curve * (1 + width), curve * (1 - width)
+# 곡선추세·매도선·매수선 (리스트 신호와 같은 계산)
+curve, upper, lower = calc_bands(y)
 
 # 화면에는 최근 disp일만 표시
 D = n
@@ -336,7 +413,6 @@ if idx_arr is not None:
         unsafe_allow_html=True)
 
 # ───────────── 매수·매도 표시 (현재가가 곡선추세 상·하한에 닿거나 넘었을 때) ─────────────
-TOUCH_TOL = 0          # 0 = 상·하한에 정확히 닿거나 넘었을 때만 표시
 _up, _lo = float(upper[-1]), float(lower[-1])
 sig_html = ""
 if last >= _up * (1 - TOUCH_TOL):          # 상한에 닿거나 위로 넘음 → 파란색 매도
