@@ -29,7 +29,7 @@ header,[data-testid="stHeader"],[data-testid="stToolbar"],[data-testid="stDecora
 disp, calc, lam, kmul, band_pct = 120, 720, 8e3, 1.6, 0.0
 
 
-TOP_N = 80   # 시가총액 상위 몇 등까지 보여줄지
+TOP_N = 80   # 거래대금 상위 몇 등까지 보여줄지 (ETF 포함)
 
 
 def _num(v):
@@ -41,45 +41,93 @@ def _num(v):
         return None
 
 
-def _row(code, name, close, chg, ratio, opn, high, low):
-    """리스트 한 줄: [코드, 이름, 현재가, 대비(부호 포함), 등락률, 시가, 고가, 저가]"""
+def _row(code, name, close, chg, ratio, opn, high, low, amount=None):
+    """리스트 한 줄: [코드, 이름, 현재가, 대비(부호 포함), 등락률, 시가, 고가, 저가, 거래대금(원)]"""
     c, r = _num(close), _num(ratio)
     d = _num(chg)
     if d is not None and r is not None:      # 대비의 부호는 등락률 부호로 맞춤(상승 +, 하락 -)
         d = abs(d) * (1 if r > 0 else (-1 if r < 0 else 0))
-    return [str(code), str(name), c, d, r, _num(opn), _num(high), _num(low)]
+    return [str(code), str(name), c, d, r, _num(opn), _num(high), _num(low), _num(amount)]
+
+
+def _won_scale(amount, price, volume) -> float:
+    """거래대금 단위를 '원'으로 맞추는 배수. (현재가×거래량)과 비교해 자동으로 판단
+    예) 주식 목록은 원 단위 → 1, ETF 목록은 백만원 단위 → 1,000,000"""
+    a = pd.to_numeric(pd.Series(amount), errors="coerce").to_numpy(dtype=float)
+    pv = (pd.to_numeric(pd.Series(price), errors="coerce") * pd.to_numeric(pd.Series(volume), errors="coerce")).to_numpy(dtype=float)
+    ok = np.isfinite(a) & np.isfinite(pv) & (a > 0) & (pv > 0)
+    if ok.sum() < 5:
+        return 1.0
+    return float(10 ** round(np.log10(np.median(pv[ok] / a[ok]))))
+
+
+def _etf_rows():
+    """국내 ETF 전체 (모두 유가증권시장=코스피 상장). 시가·고가·저가는 목록에 없어서 일봉에서 채움"""
+    try:
+        e = fdr.StockListing("ETF/KR")
+        code, name, price, chg, rate, vol, amt = (e.get("Symbol"), e.get("Name"), e.get("Price"), e.get("Change"),
+                                                  e.get("ChangeRate"), e.get("Volume"), e.get("Amount"))
+    except Exception:
+        import requests
+        j = requests.get("https://finance.naver.com/api/sise/etfItemList.nhn",
+                         headers={"User-Agent": "Mozilla/5.0"}, timeout=8).json()
+        e = pd.DataFrame(j["result"]["etfItemList"])
+        code, name, price, chg, rate, vol, amt = (e["itemcode"], e["itemname"], e["nowVal"], e["changeVal"],
+                                                  e["changeRate"], e["quant"], e["amonut"])
+    k = _won_scale(amt, price, vol)
+    return [_row(c, n, p, d, r, None, None, None, None if _num(a) is None else _num(a) * k)
+            for c, n, p, d, r, a in zip(code, name, price, chg, rate, amt)]
+
+
+def _top_by_amount(rows, n):
+    return sorted(rows, key=lambda r: -(r[8] or 0))[:n]
 
 
 def _from_fdr(n):
     d = fdr.StockListing("KRX")
-    if "Marcap" not in d.columns:
-        raise ValueError("시가총액 정보 없음")
+    if "Amount" not in d.columns:
+        raise ValueError("거래대금 정보 없음")
     cc = "Code" if "Code" in d.columns else "Symbol"
     rc = next((c for c in ("ChagesRatio", "ChangesRatio", "ChangeRatio") if c in d.columns), None)
+    k = _won_scale(d["Amount"], d.get("Close"), d.get("Volume"))
     mk = d["Market"].astype(str).str.upper()
     out = {}
     for m in ("KOSPI", "KOSDAQ"):
         s = d[mk.str.startswith("KOSDAQ")] if m == "KOSDAQ" else d[mk == "KOSPI"]
-        s = s.assign(_mc=pd.to_numeric(s["Marcap"], errors="coerce")).sort_values("_mc", ascending=False).head(n)
-        out[m] = [_row(r[cc], r["Name"], r.get("Close"), r.get("Changes"), r.get(rc) if rc else None,
-                       r.get("Open"), r.get("High"), r.get("Low")) for _, r in s.iterrows()]
+        rows = [_row(r[cc], r["Name"], r.get("Close"), r.get("Changes"), r.get(rc) if rc else None,
+                     r.get("Open"), r.get("High"), r.get("Low"),
+                     None if _num(r.get("Amount")) is None else _num(r.get("Amount")) * k) for _, r in s.iterrows()]
+        if m == "KOSPI":
+            try:
+                rows += _etf_rows()               # 코스피 목록에 ETF 포함
+            except Exception:
+                pass
+        out[m] = _top_by_amount(rows, n)
     if not out["KOSPI"] or not out["KOSDAQ"]:
         raise ValueError("빈 목록")
     return out
 
 
 def _from_naver(n):
+    """예비용: 네이버 시세(종목 200개씩 받아 거래대금 순으로 정렬) + ETF"""
     import requests
     out = {}
     for m in ("KOSPI", "KOSDAQ"):
         r = requests.get(f"https://m.stock.naver.com/api/stocks/marketValue/{m}",
-                         params={"page": 1, "pageSize": n}, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-        rows = []
-        for s in r.json().get("stocks", [])[:n]:
-            rows.append(_row(s.get("itemCode"), s.get("stockName"), s.get("closePrice"),
-                             s.get("compareToPreviousClosePrice"), s.get("fluctuationsRatio"),
-                             s.get("openPrice"), s.get("highPrice"), s.get("lowPrice")))
-        out[m] = rows
+                         params={"page": 1, "pageSize": 200}, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+        st_ = r.json().get("stocks", [])
+        amt = [s.get("accumulatedTradingValue") for s in st_]
+        k = _won_scale(amt, [s.get("closePrice") for s in st_], [s.get("accumulatedTradingVolume") for s in st_])
+        rows = [_row(s.get("itemCode"), s.get("stockName"), s.get("closePrice"),
+                     s.get("compareToPreviousClosePrice"), s.get("fluctuationsRatio"),
+                     s.get("openPrice"), s.get("highPrice"), s.get("lowPrice"),
+                     None if _num(a) is None else _num(a) * k) for s, a in zip(st_, amt)]
+        if m == "KOSPI":
+            try:
+                rows += _etf_rows()
+            except Exception:
+                pass
+        out[m] = _top_by_amount(rows, n)
     if not out["KOSPI"] or not out["KOSDAQ"]:
         raise ValueError("빈 목록")
     return out
@@ -87,7 +135,7 @@ def _from_naver(n):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def top_lists(n: int = TOP_N):
-    """코스피·코스닥 시가총액 1~n위. 10분 동안은 저장해 둔 목록을 그대로 사용 (새로고침 버튼으로 바로 다시 받기)"""
+    """코스피(ETF 포함)·코스닥 거래대금 1~n위. 10분 동안은 저장해 둔 목록을 그대로 사용 (새로고침 버튼으로 바로 다시 받기)"""
     asof = pd.Timestamp.now(tz="Asia/Seoul").strftime("%m-%d %H:%M")
     for f in (_from_fdr, _from_naver):            # 먼저 FinanceDataReader, 안 되면 네이버에서 받기
         try:
@@ -288,7 +336,7 @@ LIST_CSS = """<style>
 .sl-top .brk{display:none}
 @media (max-width:600px){.sl-top{flex-wrap:wrap;row-gap:6px}.sl-top .brk{display:block;flex-basis:100%;height:0}.sl-top .tm{flex:1 1 auto;font-size:12px}.sl-top .asof{font-size:12px}}
 .sl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border:1px solid #c9ced6}
-.sl-wrap table{border-collapse:collapse;width:100%;min-width:760px;font-size:13px;margin:0}
+.sl-wrap table{border-collapse:collapse;width:100%;min-width:840px;font-size:13px;margin:0}
 .sl-wrap th{background:#e9edf3;color:#333;font-weight:600;padding:6px;border:1px solid #d3d8df;white-space:nowrap;text-align:center}
 .sl-wrap td{padding:0;border:1px solid #e3e6ea;white-space:nowrap;text-align:right;font-variant-numeric:tabular-nums}
 .sl-wrap td a{display:block;padding:6px;color:inherit !important;text-decoration:none !important}
@@ -303,7 +351,7 @@ LIST_CSS = """<style>
 @media (max-width:600px){
  .sl-top a.tab{min-width:80px;padding:7px 10px;font-size:15px}
  .sl-top a.tab.rf{min-width:0;padding:7px 8px;font-size:13px}
- .sl-wrap table{min-width:620px}
+ .sl-wrap table{min-width:700px}
  .sl-wrap th.cd,.sl-wrap td.cd{display:none}
  .sl-wrap td.nm .sub{display:block}
  .sl-wrap td.nm{max-width:118px}
@@ -323,7 +371,7 @@ if not qp.get("code"):
         with _store()["lock"]:
             _store()["data"].clear()
         del st.query_params["refresh"]
-    with st.spinner("코스피·코스닥 시가총액 순위를 불러오는 중입니다…"):
+    with st.spinner("코스피·코스닥 거래대금 순위를 불러오는 중입니다…"):
         _tl = time.time()
         lists, asof = top_lists()
         t_list = time.time() - _tl
@@ -339,9 +387,14 @@ if not qp.get("code"):
         h.append(tm or '<span class="tm">⏱ 측정 중…</span>')
         h.append(f'<span class="asof">기준 {asof}</span></div>')
         h.append('<div class="sl-wrap"><table><thead><tr><th class="rk">순위</th><th class="cd">종목코드</th>'
-                 '<th class="nm">종목명</th><th>신호</th><th>현재가</th><th>대비</th><th>등락률</th>'
+                 '<th class="nm">종목명</th><th>신호</th><th>현재가</th><th>대비</th><th>등락률</th><th>거래대금(억)</th>'
                  '<th>시가</th><th>고가</th><th>저가</th></tr></thead><tbody>')
-        for i, (c, nm, close, chg, pct, op, hi, lo) in enumerate(rows, 1):
+        for i, (c, nm, close, chg, pct, op, hi, lo, amt) in enumerate(rows, 1):
+            if op is None and hi is None and lo is None:       # ETF: 시가·고가·저가는 받아 둔 일봉 마지막 날로 채움
+                _d = cached_hist(c, days)
+                if _d is not None and len(_d):
+                    _l = _d.iloc[-1]
+                    op, hi, lo = _num(_l.get("Open")), _num(_l.get("High")), _num(_l.get("Low"))
             href = html.escape(link(code=c, name=nm, mkt=market))
             a = f'<a href="{href}" target="_self">'
             prev = close - chg if (close is not None and chg is not None) else None
@@ -363,6 +416,7 @@ if not qp.get("code"):
                 f'<td class="{k}">{a}{n0(close)}</a></td>'
                 f'<td class="{k}">{a}{arrow}{n0(None if chg is None else abs(chg))}</a></td>'
                 f'<td class="{k}">{a}{pct_t}</a></td>'
+                f'<td class="eq">{a}{"-" if amt is None else f"{amt / 1e8:,.0f}"}</a></td>'
                 f'<td class="{ud(op, prev)}">{a}{n0(op)}</a></td>'
                 f'<td class="{ud(hi, prev)}">{a}{n0(hi)}</a></td>'
                 f'<td class="{ud(lo, prev)}">{a}{n0(lo)}</a></td></tr>')
