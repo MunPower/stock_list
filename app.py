@@ -91,6 +91,11 @@ def _from_fdr(n):
     d = fdr.StockListing("KRX")
     if "Amount" not in d.columns or "Marcap" not in d.columns:
         raise ValueError("거래대금·시가총액 정보 없음")
+    # 장 시작 직후 등 거래소 자료가 아직 비어 있으면(종목 이름만 있고 가격·시가총액이 없음) 이 목록은 쓰지 않음
+    ok = (pd.to_numeric(d.get("Close"), errors="coerce") > 0) & (pd.to_numeric(d["Marcap"], errors="coerce") > 0)
+    if ok.sum() < 500:
+        raise ValueError(f"가격·시가총액이 있는 종목이 {int(ok.sum())}개뿐 (자료 준비 전)")
+    d = d[ok]
     cc = "Code" if "Code" in d.columns else "Symbol"
     rc = next((c for c in ("ChagesRatio", "ChangesRatio", "ChangeRatio") if c in d.columns), None)
     k = _won_scale(d["Amount"], d.get("Close"), d.get("Volume"))
@@ -132,6 +137,8 @@ def _from_naver(n):
                      s.get("compareToPreviousClosePrice"), s.get("fluctuationsRatio"),
                      s.get("openPrice"), s.get("highPrice"), s.get("lowPrice"),
                      None if _num(a) is None else _num(a) * k) for s, a in zip(st_, amt)]
+        if sum(r[2] is not None for r in rows[:n]) < n * 0.8:
+            raise ValueError("네이버 시세도 비어 있음")
         out.setdefault("cap", {})[m] = rows[:n]            # 네이버 목록은 원래 시가총액 순서
         if m == "KOSPI":
             try:
@@ -149,12 +156,13 @@ def top_lists(n: int = TOP_N):
     """{"cap": 시가총액 1~n위, "amt": 거래대금 1~n위(코스피는 ETF 포함)} × 코스피·코스닥.
     10분 동안은 저장해 둔 목록을 그대로 사용 (새로고침 버튼으로 바로 다시 받기)"""
     asof = pd.Timestamp.now(tz="Asia/Seoul").strftime("%m-%d %H:%M")
+    errs = []
     for f in (_from_fdr, _from_naver):            # 먼저 FinanceDataReader, 안 되면 네이버에서 받기
         try:
             return f(n), asof
-        except Exception:
-            continue
-    return {"cap": {"KOSPI": [], "KOSDAQ": []}, "amt": {"KOSPI": [], "KOSDAQ": []}}, asof
+        except Exception as e:
+            errs.append(f"{f.__name__}: {e}")
+    raise RuntimeError(" / ".join(errs))           # 실패한 결과는 10분 저장하지 않고, 다음에 열 때 다시 받음
 
 
 # ───────────── 공통: 시세 받기 + 매도선·매수선 계산 (리스트 신호와 차트가 똑같이 사용) ─────────────
@@ -388,7 +396,14 @@ if not qp.get("code"):
         del st.query_params["refresh"]
     with st.spinner("코스피·코스닥 순위를 불러오는 중입니다…"):
         _tl = time.time()
-        lists, asof = top_lists()
+        try:
+            lists, asof = top_lists()
+        except Exception as e:
+            st.error("시세 목록을 받지 못했습니다. 장 시작 직후에는 거래소 자료가 아직 준비되지 않았을 수 있어요. "
+                     "1~2분 뒤에 ↻ 새로고침해 주세요.")
+            st.markdown(f'<a href="{link(m=market, s=sort, refresh=1)}" target="_self">↻ 새로고침</a>', unsafe_allow_html=True)
+            st.caption(f"(자세한 내용: {e})")
+            st.stop()
         t_list = time.time() - _tl
     rows = lists.get(sort, {}).get(market, [])
     if not rows:
