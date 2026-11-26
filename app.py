@@ -388,6 +388,7 @@ def _from_kis(n):
                 rows_cap.append(row)
         out["cap"][m] = _top_by_cap(rows_cap, n)
         out["amt"][m] = _top_by_amount(rows_all, n)
+    out["vol"] = {c: _num(q.get("acml_vol")) for c, q in live.items()}     # 오늘 누적 거래량
     if not out["cap"]["KOSPI"] or not out["cap"]["KOSDAQ"]:
         raise ValueError("한국투자 시세 빈 목록")
     return out, None
@@ -556,6 +557,95 @@ def live_px(code: str, days: int):
     return c, c - pc, (c - pc) / pc * 100, _num(last.get("Open")), _num(last.get("High")), _num(last.get("Low"))
 
 
+BASE_TTL = 6 * 3600     # 신호 계산용 지난 일봉은 6시간 보관 (바뀌는 건 오늘 하루치뿐이라)
+
+
+def cached_hist_any(code: str, days: int, max_age: float = BASE_TTL):
+    ent = _store()["data"].get((code, int(days)))
+    if ent and time.time() - ent[0] < max_age:
+        return ent[1]
+    return None
+
+
+def prefetch_base(codes, days: int, timeout: float = 40):
+    """보관함에 없거나 6시간 지난 종목만 동시에 받아 저장"""
+    from concurrent.futures import wait
+    missing = [c for c in dict.fromkeys(codes) if cached_hist_any(c, days) is None]
+    if missing:
+        ex = ThreadPoolExecutor(max_workers=8)
+        futs = [ex.submit(_fetch, c, days) for c in missing]
+        wait(futs, timeout=timeout)
+        ex.shutdown(wait=False, cancel_futures=True)
+    return len(missing)
+
+
+def merged_close(code: str, days: int, live_px=None, live_vol=None):
+    """보관한 지난 일봉 종가 + 오늘 실시간 가격 → 신호 계산용 종가 배열 (차트와 같은 길이)"""
+    d = cached_hist_any(code, days)
+    if d is None or not len(d):
+        return None
+    y = d["Close"].to_numpy(dtype=float).copy()
+    if not live_px:
+        return y
+    today = pd.Timestamp.now(tz="Asia/Seoul").date()
+    last_day = pd.Timestamp(d.index[-1]).date()
+    last_vol = _num(d["Volume"].iloc[-1]) if "Volume" in d.columns else None
+    if last_day == today:                                     # 일봉에 오늘 봉이 있음 → 지금 가격으로 바꿈
+        y[-1] = live_px
+    elif live_vol is not None and last_vol is not None and abs(live_vol - last_vol) < 1 and abs(live_px - y[-1]) < 1e-9:
+        pass                                                  # 실시간 값 = 일봉 마지막 날 (장 시작 전·휴장일)
+    elif pd.Timestamp(today).weekday() < 5:                   # 오늘 봉이 아직 없음 → 지금 가격을 오늘 봉으로 붙임
+        y = np.append(y[1:] if len(y) >= int(days) else y, live_px)
+    return y
+
+
+@st.cache_resource(show_spinner=False)
+def _warm_state():
+    return {"busy": False, "lock": threading.Lock()}
+
+
+def prewarm(codes, days: int):
+    """다른 탭(코스피/코스닥 · 시가총액/거래대금) 종목들의 일봉을 뒤에서 미리 받아 둠 (화면은 기다리지 않음)"""
+    w = _warm_state()
+    with w["lock"]:
+        if w["busy"]:
+            return
+        w["busy"] = True
+
+    def run():
+        try:
+            prefetch_base(tuple(codes), days, timeout=180)
+        finally:
+            w["busy"] = False
+    threading.Thread(target=run, daemon=True).start()
+
+
+def quick_signals(codes, days: int, live: dict) -> dict:
+    """일봉이 이미 보관돼 있는 종목만 바로 신호 계산 {코드: 'buy'/'sell'/None}"""
+    out = {}
+    for c in codes:
+        y = merged_close(c, days, *live.get(c, (None, None)))
+        if y is None:
+            continue
+        try:
+            out[c] = signal_of(y) if len(y) >= 60 and np.isfinite(y).all() else None
+        except Exception:
+            out[c] = None
+    return out
+
+
+def list_signals_live(codes: tuple, live: dict):
+    """신호: 지난 일봉(6시간 보관, 없는 것만 받음) + 오늘 실시간 가격"""
+    days = max(int(calc), 180)
+    _t = time.time()
+    prefetch_base(codes, days)
+    t_fetch = time.time() - _t
+    _t = time.time()
+    q = quick_signals(codes, days, live)
+    sig = {c: q.get(c) for c in codes}
+    return sig, len(q), t_fetch, time.time() - _t
+
+
 def list_signals(codes: tuple):
     """리스트 종목들의 매수·매도 신호 {코드: 'buy'/'sell'/None}, 시세를 받은 종목 수"""
     days = max(int(calc), 180)
@@ -722,13 +812,20 @@ if not qp.get("code"):
     days = max(int(calc), 180)
     note = st.empty()
     ph = st.empty()
-    known = known_signals(codes, days)                        # 보관된 신호(받기·계산 없이 바로)
-    ph.markdown(build(known), unsafe_allow_html=True)         # ① 리스트를 항상 먼저 표시
-    if len(known) < len(codes):
-        note.caption("⏳ 매수·매도 신호를 계산하는 중입니다… (처음 한 번은 조금 걸려요)")
+    _vol = lists.get("vol") or {}
+    live = {r[0]: (r[2], _vol.get(r[0])) for r in rows} if (basis is None and _vol) else {}   # 오늘 실시간 가격
+    _tq = time.time()
+    known = quick_signals(codes, days, live)                  # 일봉이 보관된 종목은 받기 없이 바로 신호
+    t_quick = time.time() - _tq
     _t0 = time.time()
+    if len(known) == len(codes):                              # 전부 보관돼 있으면 한 번에 표시
+        sig, _got, t_fetch, t_calc = dict(known), len(codes), 0.0, t_quick
+    else:
+        ph.markdown(build(known), unsafe_allow_html=True)     # ① 리스트를 먼저 표시
+        note.caption("⏳ 매수·매도 신호를 계산하는 중입니다… (처음 한 번만 조금 걸려요)")
     try:
-        sig, _got, t_fetch, t_calc = list_signals(codes)
+        if len(known) < len(codes):
+            sig, _got, t_fetch, t_calc = list_signals_live(codes, live)
     except Exception as e:
         sig, _got, t_fetch, t_calc = {}, len(codes), time.time() - _t0, 0.0
         st.caption(f"신호 계산 오류: {e}")
@@ -737,6 +834,10 @@ if not qp.get("code"):
         st.caption(f"※ {len(rows)}종목 중 {_got}종목만 시세를 받아 신호를 계산했습니다 ({time.time() - _t0:.0f}초).")
     _tm = timing_html([("리스트", t_list), ("시세", t_fetch), ("계산", t_calc)])
     ph.markdown(build(sig, _tm), unsafe_allow_html=True)      # ② 신호 칸 + 걸린 시간 채워서 표시
+    try:                                                      # 다른 탭 종목들의 일봉은 뒤에서 미리 받아 둠
+        prewarm([r[0] for so in ("cap", "amt") for mk in ("KOSPI", "KOSDAQ") for r in lists.get(so, {}).get(mk, [])], days)
+    except Exception:
+        pass
     st.stop()
 
 
