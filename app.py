@@ -11,6 +11,7 @@ import FinanceDataReader as fdr
 import json
 import time
 import threading
+import random
 import html
 from concurrent.futures import ThreadPoolExecutor
 import re
@@ -231,13 +232,22 @@ def _today_src(f):
 KIS_BASE = "https://openapi.koreainvestment.com:9443"     # 실전 서버 (순위 조회는 실전만 가능)
 
 
+_KIS_KEYS = {}
+
+
 def _kis_keys():
+    """Secrets에서 키 읽기 (한 번 읽으면 기억해 두고, 동시에 보내는 작업들도 같이 씀)"""
+    if _KIS_KEYS.get("k"):
+        return _KIS_KEYS["k"]
     try:
         k, s_ = st.secrets["KIS_APP_KEY"], st.secrets["KIS_APP_SECRET"]
         k, s_ = "".join(str(k).split()), "".join(str(s_).split())
-        return (k, s_) if k and s_ else None
+        if k and s_:
+            _KIS_KEYS["k"] = (k, s_)
+            return _KIS_KEYS["k"]
     except Exception:
-        return None
+        pass
+    return None
 
 
 @st.cache_resource(show_spinner=False)
@@ -266,14 +276,14 @@ def _kis_get(path: str, tr_id: str, params: dict):
     keys = _kis_keys()
     if not keys:
         raise RuntimeError("한국투자 키 없음(Secrets)")
-    for attempt in range(3):
+    for attempt in range(5):
         h = {"content-type": "application/json; charset=utf-8", "authorization": f"Bearer {_kis_token(keys)}",
              "appkey": keys[0], "appsecret": keys[1], "tr_id": tr_id, "custtype": "P"}
         j = requests.get(KIS_BASE + path, headers=h, params=params, timeout=10).json()
         if j.get("rt_cd") == "0":
             return j
         if j.get("msg_cd") == "EGW00201":            # 초당 호출 제한 → 잠깐 쉬고 다시
-            time.sleep(0.5)
+            time.sleep(0.3 + 0.3 * attempt + random.random() * 0.3)
             continue
         if j.get("msg_cd") in ("EGW00123", "EGW00121"):   # 토큰 만료/무효 → 새로 받기
             _kis_tok_store()["tok"] = None
@@ -282,17 +292,25 @@ def _kis_get(path: str, tr_id: str, params: dict):
     raise RuntimeError(f"한국투자 {tr_id}: 재시도 실패")
 
 
+KIS_PAR = 6      # 한국투자에 동시에 보내는 질문 수 (서버가 미국이라 한 번 왕복이 느려서 여러 개를 한꺼번에)
+
+
 def kis_multprice(codes) -> dict:
-    """여러 종목 실시간 시세 (30종목씩 한 번에) → {코드: 응답 한 줄}"""
-    out, codes = {}, list(dict.fromkeys(codes))
-    for i in range(0, len(codes), 30):
+    """여러 종목 실시간 시세 (30종목씩 묶어서, 여러 묶음을 동시에) → {코드: 응답 한 줄}"""
+    codes = list(dict.fromkeys(codes))
+
+    def one(chunk):
         p = {}
-        for k, c in enumerate(codes[i:i + 30], 1):
+        for k, c in enumerate(chunk, 1):
             p[f"FID_COND_MRKT_DIV_CODE_{k}"] = "J"
             p[f"FID_INPUT_ISCD_{k}"] = c
-        for r in _kis_get("/uapi/domestic-stock/v1/quotations/intstock-multprice", "FHKST11300006", p).get("output") or []:
-            out[str(r.get("inter_shrn_iscd"))] = r
-        time.sleep(0.06)
+        return _kis_get("/uapi/domestic-stock/v1/quotations/intstock-multprice", "FHKST11300006", p).get("output") or []
+    chunks = [codes[i:i + 30] for i in range(0, len(codes), 30)]
+    out = {}
+    with ThreadPoolExecutor(max_workers=KIS_PAR) as ex:
+        for rows in ex.map(one, chunks):
+            for r in rows:
+                out[str(r.get("inter_shrn_iscd"))] = r
     return out
 
 
@@ -309,7 +327,6 @@ def kis_top30(kind: str, iscd: str):
             "FID_DIV_CLS_CODE": "0", "FID_BLNG_CLS_CODE": "3", "FID_TRGT_CLS_CODE": "111111111",
             "FID_TRGT_EXLS_CLS_CODE": "000000", "FID_INPUT_PRICE_1": "", "FID_INPUT_PRICE_2": "",
             "FID_VOL_CNT": "", "FID_INPUT_DATE_1": ""})
-    time.sleep(0.06)
     return j.get("output") or []
 
 
@@ -338,16 +355,19 @@ def _from_kis(n):
         pool = {"cap": {"KOSPI": [], "KOSDAQ": []}, "amt": {"KOSPI": [], "KOSDAQ": []}}
     out = {"cap": {}, "amt": {}}
     cands = {}
+    jobs = [(k, i) for i in ("0001", "1001") for k in ("cap", "amt")]
+    with ThreadPoolExecutor(max_workers=4) as ex:          # 한국투자 실시간 30등 4가지를 동시에
+        top30 = dict(zip(jobs, ex.map(lambda a: kis_top30(*a), jobs)))
     for m, iscd in (("KOSPI", "0001"), ("KOSDAQ", "1001")):
         c = {}                                     # 코드 → [이름, 기준일 종가, 기준일 시가총액, 실시간 시가총액, 시가총액 후보?]
         for r in pool["cap"].get(m, []):
             c[r[0]] = [r[1], r[2], r[9], None, True]
         for r in pool["amt"].get(m, []):
             c.setdefault(r[0], [r[1], r[2], r[9], None, False])
-        for r in kis_top30("cap", iscd):
+        for r in top30[("cap", iscd)]:
             e = c.setdefault(str(r.get("mksc_shrn_iscd")), [r.get("hts_kor_isnm"), None, None, None, True])
             e[3], e[4] = (_num(r.get("stck_avls")) or 0) * 1e8 or None, True     # 시가총액 단위: 억원
-        for r in kis_top30("amt", iscd):
+        for r in top30[("amt", iscd)]:
             c.setdefault(str(r.get("mksc_shrn_iscd")), [r.get("hts_kor_isnm"), None, None, None, False])
         cands[m] = c
     live = kis_multprice([k for m in cands for k in cands[m]])
