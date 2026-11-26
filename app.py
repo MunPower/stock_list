@@ -87,6 +87,72 @@ def _top_by_cap(rows, n):
     return sorted(rows, key=lambda r: -(r[9] or 0))[:n]
 
 
+KRX_URL = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
+
+
+def _krx(bld: str, date: str, **kw):
+    import requests
+    r = requests.post(KRX_URL, data={"bld": bld, "locale": "ko_KR", "trdDd": date, "share": "1", "money": "1",
+                                     "csvxls_isNo": "false", **kw},
+                      headers={"User-Agent": "Mozilla/5.0",
+                               "Referer": "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd?menuId=MDC0201020101"},
+                      timeout=10)
+    j = r.json()
+    return j.get("OutBlock_1") or j.get("output") or []
+
+
+def _krx_rows(items, scale_from=None):
+    """거래소 자료 한 줄씩 → 리스트 한 줄 (거래대금 단위는 현재가×거래량과 비교해 원으로 맞춤)"""
+    k = _won_scale([x.get("ACC_TRDVAL") for x in items], [x.get("TDD_CLSPRC") for x in items],
+                   [x.get("ACC_TRDVOL") for x in items])
+    out = []
+    for x in items:
+        a = _num(x.get("ACC_TRDVAL"))
+        out.append(_row(x.get("ISU_SRT_CD"), x.get("ISU_ABBRV"), x.get("TDD_CLSPRC"), x.get("CMPPREVDD_PRC"),
+                        x.get("FLUC_RT"), x.get("TDD_OPNPRC"), x.get("TDD_HGPRC"), x.get("TDD_LWPRC"),
+                        None if a is None else a * k, x.get("MKTCAP")))
+    return out
+
+
+def _from_krx(n):
+    """거래소 전종목 시세. 장중에는 '오늘' 자료가 비어 있으므로 하루씩 거슬러 가며 가격이 채워진 날짜를 사용"""
+    today = pd.Timestamp.now(tz="Asia/Seoul").normalize()
+    items, day = [], None
+    for back in range(10):
+        d = today - pd.Timedelta(days=back)
+        if d.weekday() >= 5:                       # 토·일은 건너뜀
+            continue
+        try:
+            got = _krx("dbms/MDC/STAT/standard/MDCSTAT01501", d.strftime("%Y%m%d"), mktId="ALL")
+        except Exception:
+            got = []
+        good = [x for x in got if (_num(x.get("TDD_CLSPRC")) or 0) > 0 and (_num(x.get("MKTCAP")) or 0) > 0]
+        if len(good) >= 500:
+            items, day = good, d
+            break
+    if not items:
+        raise ValueError("최근 거래소 자료 없음")
+    try:                                           # ETF 전종목 (같은 날짜)
+        etf_items = [x for x in _krx("dbms/MDC/STAT/standard/MDCSTAT04301", day.strftime("%Y%m%d"))
+                     if (_num(x.get("TDD_CLSPRC")) or 0) > 0]
+        etfs = _krx_rows(etf_items) if len(etf_items) >= 50 else _etf_rows()
+    except Exception:
+        try:
+            etfs = _etf_rows()
+        except Exception:
+            etfs = []
+    out = {"cap": {}, "amt": {}}
+    for m in ("KOSPI", "KOSDAQ"):
+        its = [x for x in items if str(x.get("MKT_NM", "")).upper().startswith(m) and
+               (m == "KOSDAQ" or str(x.get("MKT_NM", "")).upper() == "KOSPI")]
+        rows = _krx_rows(its)
+        out["cap"][m] = _top_by_cap(rows, n)
+        out["amt"][m] = _top_by_amount(rows + (etfs if m == "KOSPI" else []), n)
+    if not out["cap"]["KOSPI"] or not out["cap"]["KOSDAQ"]:
+        raise ValueError("빈 목록")
+    return out, (None if day == today else day.strftime("%m-%d"))
+
+
 def _from_fdr(n):
     d = fdr.StockListing("KRX")
     if "Amount" not in d.columns or "Marcap" not in d.columns:
@@ -151,15 +217,179 @@ def _from_naver(n):
     return out
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+def _today_src(f):
+    """오늘 자료로 만드는 받기 방법 → (목록, 순위 기준일 None)"""
+    def g(n):
+        return f(n), None
+    g.__name__ = f.__name__
+    return g
+
+
+# ───────────── 한국투자증권 Open API (실시간 시세) ─────────────
+# 키는 코드에 넣지 않고 Streamlit의 Secrets(비밀 보관함)에서 읽음:
+#   KIS_APP_KEY = "앱키"      KIS_APP_SECRET = "앱시크릿"
+KIS_BASE = "https://openapi.koreainvestment.com:9443"     # 실전 서버 (순위 조회는 실전만 가능)
+
+
+def _kis_keys():
+    try:
+        k, s_ = st.secrets["KIS_APP_KEY"], st.secrets["KIS_APP_SECRET"]
+        k, s_ = "".join(str(k).split()), "".join(str(s_).split())
+        return (k, s_) if k and s_ else None
+    except Exception:
+        return None
+
+
+@st.cache_resource(show_spinner=False)
+def _kis_tok_store():
+    """접근토큰 보관 (하루 유효). 자주 새로 받으면 제한에 걸리므로 서버에 보관해 재사용"""
+    return {"tok": None, "exp": 0.0, "lock": threading.Lock()}
+
+
+def _kis_token(keys) -> str:
+    import requests
+    t = _kis_tok_store()
+    with t["lock"]:
+        if t["tok"] and time.time() < t["exp"]:
+            return t["tok"]
+        r = requests.post(f"{KIS_BASE}/oauth2/tokenP", timeout=10,
+                          json={"grant_type": "client_credentials", "appkey": keys[0], "appsecret": keys[1]})
+        j = r.json()
+        if "access_token" not in j:
+            raise RuntimeError(f"한국투자 토큰 실패: {j.get('error_description') or j.get('msg1') or r.status_code}")
+        t["tok"], t["exp"] = j["access_token"], time.time() + int(j.get("expires_in", 86400)) - 600
+        return t["tok"]
+
+
+def _kis_get(path: str, tr_id: str, params: dict):
+    import requests
+    keys = _kis_keys()
+    if not keys:
+        raise RuntimeError("한국투자 키 없음(Secrets)")
+    for attempt in range(3):
+        h = {"content-type": "application/json; charset=utf-8", "authorization": f"Bearer {_kis_token(keys)}",
+             "appkey": keys[0], "appsecret": keys[1], "tr_id": tr_id, "custtype": "P"}
+        j = requests.get(KIS_BASE + path, headers=h, params=params, timeout=10).json()
+        if j.get("rt_cd") == "0":
+            return j
+        if j.get("msg_cd") == "EGW00201":            # 초당 호출 제한 → 잠깐 쉬고 다시
+            time.sleep(0.5)
+            continue
+        if j.get("msg_cd") in ("EGW00123", "EGW00121"):   # 토큰 만료/무효 → 새로 받기
+            _kis_tok_store()["tok"] = None
+            continue
+        raise RuntimeError(f"한국투자 {tr_id}: {j.get('msg_cd')} {j.get('msg1')}")
+    raise RuntimeError(f"한국투자 {tr_id}: 재시도 실패")
+
+
+def kis_multprice(codes) -> dict:
+    """여러 종목 실시간 시세 (30종목씩 한 번에) → {코드: 응답 한 줄}"""
+    out, codes = {}, list(dict.fromkeys(codes))
+    for i in range(0, len(codes), 30):
+        p = {}
+        for k, c in enumerate(codes[i:i + 30], 1):
+            p[f"FID_COND_MRKT_DIV_CODE_{k}"] = "J"
+            p[f"FID_INPUT_ISCD_{k}"] = c
+        for r in _kis_get("/uapi/domestic-stock/v1/quotations/intstock-multprice", "FHKST11300006", p).get("output") or []:
+            out[str(r.get("inter_shrn_iscd"))] = r
+        time.sleep(0.06)
+    return out
+
+
+def kis_top30(kind: str, iscd: str):
+    """한국투자 실시간 순위 30등 (kind: 'cap' 시가총액 / 'amt' 거래대금, iscd: 0001 코스피 / 1001 코스닥)"""
+    if kind == "cap":
+        j = _kis_get("/uapi/domestic-stock/v1/ranking/market-cap", "FHPST01740000", {
+            "fid_cond_mrkt_div_code": "J", "fid_cond_scr_div_code": "20174", "fid_div_cls_code": "0",
+            "fid_input_iscd": iscd, "fid_trgt_cls_code": "0", "fid_trgt_exls_cls_code": "0",
+            "fid_input_price_1": "", "fid_input_price_2": "", "fid_vol_cnt": ""})
+    else:
+        j = _kis_get("/uapi/domestic-stock/v1/quotations/volume-rank", "FHPST01710000", {
+            "FID_COND_MRKT_DIV_CODE": "J", "FID_COND_SCR_DIV_CODE": "20171", "FID_INPUT_ISCD": iscd,
+            "FID_DIV_CLS_CODE": "0", "FID_BLNG_CLS_CODE": "3", "FID_TRGT_CLS_CODE": "111111111",
+            "FID_TRGT_EXLS_CLS_CODE": "000000", "FID_INPUT_PRICE_1": "", "FID_INPUT_PRICE_2": "",
+            "FID_VOL_CNT": "", "FID_INPUT_DATE_1": ""})
+    time.sleep(0.06)
+    return j.get("output") or []
+
+
+POOL_N = 150     # 후보: 전날 기준 시가총액·거래대금 상위 150개씩 (+ ETF) → 실시간 시세로 다시 줄 세움
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def krx_pool():
+    """후보 목록(전날 또는 가장 최근 마감 기준). 하루에 몇 번만 바뀌므로 30분 보관"""
+    errs = []
+    for f in (_from_krx, _today_src(_from_fdr)):
+        try:
+            return f(POOL_N)
+        except Exception as e:
+            errs.append(f"{f.__name__}: {e}")
+    raise RuntimeError(" / ".join(errs))
+
+
+def _from_kis(n):
+    """한국투자증권 실시간: 후보(전날 상위 + 한국투자 실시간 30등) 전체의 지금 시세로 1~n위를 다시 매김"""
+    if not _kis_keys():
+        raise RuntimeError("한국투자 키 없음(Secrets)")
+    try:
+        pool, _ = krx_pool()
+    except Exception:
+        pool = {"cap": {"KOSPI": [], "KOSDAQ": []}, "amt": {"KOSPI": [], "KOSDAQ": []}}
+    out = {"cap": {}, "amt": {}}
+    cands = {}
+    for m, iscd in (("KOSPI", "0001"), ("KOSDAQ", "1001")):
+        c = {}                                     # 코드 → [이름, 기준일 종가, 기준일 시가총액, 실시간 시가총액, 시가총액 후보?]
+        for r in pool["cap"].get(m, []):
+            c[r[0]] = [r[1], r[2], r[9], None, True]
+        for r in pool["amt"].get(m, []):
+            c.setdefault(r[0], [r[1], r[2], r[9], None, False])
+        for r in kis_top30("cap", iscd):
+            e = c.setdefault(str(r.get("mksc_shrn_iscd")), [r.get("hts_kor_isnm"), None, None, None, True])
+            e[3], e[4] = (_num(r.get("stck_avls")) or 0) * 1e8 or None, True     # 시가총액 단위: 억원
+        for r in kis_top30("amt", iscd):
+            c.setdefault(str(r.get("mksc_shrn_iscd")), [r.get("hts_kor_isnm"), None, None, None, False])
+        cands[m] = c
+    live = kis_multprice([k for m in cands for k in cands[m]])
+    for m, c in cands.items():
+        rows_cap, rows_all = [], []
+        for code, (name, pclose, pcap, kcap, is_cap) in c.items():
+            q = live.get(code)
+            if not q:
+                continue
+            px_ = _num(q.get("inter2_prpr"))
+            if not px_:
+                continue
+            cap = kcap or (pcap * px_ / pclose if pcap and pclose else None)       # 실시간 시가총액
+            row = _row(code, q.get("inter_kor_isnm") or name, px_, q.get("inter2_prdy_vrss"), q.get("prdy_ctrt"),
+                       q.get("inter2_oprc"), q.get("inter2_hgpr"), q.get("inter2_lwpr"), q.get("acml_tr_pbmn"), cap)
+            rows_all.append(row)
+            if is_cap:
+                rows_cap.append(row)
+        out["cap"][m] = _top_by_cap(rows_cap, n)
+        out["amt"][m] = _top_by_amount(rows_all, n)
+    if not out["cap"]["KOSPI"] or not out["cap"]["KOSDAQ"]:
+        raise ValueError("한국투자 시세 빈 목록")
+    return out, None
+
+
+def _pool_src(n):
+    """후보 목록(전날 기준)을 그대로 n위까지 사용 (한국투자 키가 없거나 실패했을 때)"""
+    pool, basis = krx_pool()
+    return {k: {m: v[:n] for m, v in d.items()} for k, d in pool.items()}, basis
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def top_lists(n: int = TOP_N):
     """{"cap": 시가총액 1~n위, "amt": 거래대금 1~n위(코스피는 ETF 포함)} × 코스피·코스닥.
-    10분 동안은 저장해 둔 목록을 그대로 사용 (새로고침 버튼으로 바로 다시 받기)"""
+    1분 동안은 저장해 둔 목록을 그대로 사용 (새로고침 버튼으로 바로 다시 받기)"""
     asof = pd.Timestamp.now(tz="Asia/Seoul").strftime("%m-%d %H:%M")
     errs = []
-    for f in (_from_fdr, _from_naver):            # 먼저 FinanceDataReader, 안 되면 네이버에서 받기
+    # ① 한국투자증권 실시간 → ② 거래소 전날 순위(후보 목록) → ③ 네이버
+    for f in (_from_kis, _pool_src, _today_src(_from_naver)):
         try:
-            return f(n), asof
+            out, basis = f(n)
+            return out, asof, basis
         except Exception as e:
             errs.append(f"{f.__name__}: {e}")
     raise RuntimeError(" / ".join(errs))           # 실패한 결과는 10분 저장하지 않고, 다음에 열 때 다시 받음
@@ -294,6 +524,18 @@ def timing_html(parts) -> str:
     return '<span class="tm">⏱ ' + " · ".join(out) + "</span>"
 
 
+def live_px(code: str, days: int):
+    """받아 둔 일봉(10분 보관)의 마지막 날 → (현재가, 대비, 등락률, 시가, 고가, 저가). 없으면 None"""
+    d = cached_hist(code, days)
+    if d is None or len(d) < 2:
+        return None
+    last, prev = d.iloc[-1], d.iloc[-2]
+    c, pc = _num(last.get("Close")), _num(prev.get("Close"))
+    if not c or not pc:
+        return None
+    return c, c - pc, (c - pc) / pc * 100, _num(last.get("Open")), _num(last.get("High")), _num(last.get("Low"))
+
+
 def list_signals(codes: tuple):
     """리스트 종목들의 매수·매도 신호 {코드: 'buy'/'sell'/None}, 시세를 받은 종목 수"""
     days = max(int(calc), 180)
@@ -397,10 +639,9 @@ if not qp.get("code"):
     with st.spinner("코스피·코스닥 순위를 불러오는 중입니다…"):
         _tl = time.time()
         try:
-            lists, asof = top_lists()
+            lists, asof, basis = top_lists()
         except Exception as e:
-            st.error("시세 목록을 받지 못했습니다. 장 시작 직후에는 거래소 자료가 아직 준비되지 않았을 수 있어요. "
-                     "1~2분 뒤에 ↻ 새로고침해 주세요.")
+            st.error("시세 목록을 받지 못했습니다. 1~2분 뒤에 ↻ 새로고침해 주세요.")
             st.markdown(f'<a href="{link(m=market, s=sort, refresh=1)}" target="_self">↻ 새로고침</a>', unsafe_allow_html=True)
             st.caption(f"(자세한 내용: {e})")
             st.stop()
@@ -418,18 +659,17 @@ if not qp.get("code"):
         h.append(f'<a class="tab rf" href="{link(m=market, s=sort, refresh=1)}" target="_self" title="시세 다시 받기">↻ 새로고침</a>'
                  '<span class="brk b1"></span><span class="brk b2"></span>')
         h.append(tm or '<span class="tm">⏱ 측정 중…</span>')
-        h.append(f'<span class="asof">기준 {asof}</span></div>')
+        h.append(f'<span class="asof">{"순위 " + basis + " 기준 · " if basis else ""}기준 {asof}</span></div>')
         h.append('<div class="sl-wrap"><table><thead><tr><th class="rk">순위</th><th class="cd">종목코드</th>'
                  '<th class="nm">종목명</th><th>신호</th><th>현재가</th><th>대비</th><th>등락률</th>'
                  + ('<th>거래대금(억)</th>' if sort == "amt" else '<th>시가총액(억)</th>') +
                  '<th>시가</th><th>고가</th><th>저가</th></tr></thead><tbody>')
         for i, (c, nm, close, chg, pct, op, hi, lo, amt, cap) in enumerate(rows, 1):
             base = amt if sort == "amt" else cap               # 순위 기준 칸에 보여줄 값
-            if op is None and hi is None and lo is None:       # ETF: 시가·고가·저가는 받아 둔 일봉 마지막 날로 채움
-                _d = cached_hist(c, days)
-                if _d is not None and len(_d):
-                    _l = _d.iloc[-1]
-                    op, hi, lo = _num(_l.get("Open")), _num(_l.get("High")), _num(_l.get("Low"))
+            if basis or op is None:                             # 전날 순위일 때만: 현재가·대비·시가·고가·저가를 받아 둔 일봉(실시간)으로
+                _lp = live_px(c, days)
+                if _lp:
+                    close, chg, pct, op, hi, lo = _lp
             href = html.escape(link(code=c, name=nm, mkt=market, s=sort))
             a = f'<a href="{href}" target="_self">'
             prev = close - chg if (close is not None and chg is not None) else None

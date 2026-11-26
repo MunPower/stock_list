@@ -3,3 +3,4 @@ finance-datareader
 plotly
 numpy
 pandas
+requests
